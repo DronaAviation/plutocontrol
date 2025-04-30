@@ -131,7 +131,7 @@ class pluto:
         self.rcThrottle = 1500
         self.rcPitch = 1500
         self.rcYaw = 1500
-        self.commandType = 0
+        self.command_type = 0
 
     def increase_height(self):
         print("Increasing height")
@@ -145,10 +145,10 @@ class pluto:
         self.disarm()
         self.box_arm()
         print("take off")
-        self.commandType = 1
+        self.command_type = 1
 
     def land(self):
-        self.commandType = 2
+        self.command_type = 2
 
     def rc_values(self):
         return [self.rcRoll, self.rcPitch, self.rcThrottle, self.rcYaw,
@@ -243,7 +243,6 @@ class pluto:
 
             self.send_request_msp_set_raw_rc(self.droneRC)
             self.send_request_msp_get_debug(requests)
-
             if self.command_type != self.NONE_COMMAND:
                 self.send_request_msp_set_command(self.command_type)
                 self.command_type = self.NONE_COMMAND
