@@ -34,7 +34,7 @@ MSP_SET_1WIRE = 243
 MSP_VARIO = 122  # Example MSP command for vario (check your drone's documentation for the correct value)
 RETRY_COUNT = 3
 
-class pluto:
+class Pluto:
     def __init__(self, ip='192.168.4.1', port=23):
         # RC channel values
         self.rcRoll = 1500
@@ -110,6 +110,7 @@ class pluto:
             self.client.settimeout(5.0)  # 5 second timeout for connection
             try:
                 self.client.connect((self.TCP_IP, self.TCP_PORT))
+                self.client.settimeout(1.0)  # 1 second timeout for reads
                 self.connected = True
                 print(f"Connected to drone at {self.TCP_IP}:{self.TCP_PORT}")
                 self.start_write_function()
@@ -137,7 +138,7 @@ class pluto:
             if self.client:
                 try:
                     self.client.close()
-                except:
+                except Exception:
                     pass
             
             print("Disconnected from drone")
@@ -295,7 +296,7 @@ class pluto:
         """
         print("Land")
         with self._lock:
-            self.command_type = self.LAND2
+            self.command_type = self.LAND
 
     def rc_values(self) -> list[int]:
         """Returns the current RC channel values."""
@@ -397,11 +398,7 @@ class pluto:
         self.send_request_msp(self.create_packet_msp(MSP_EEPROM_WRITE, []))
 
     def send_request_msp_set_motor(self, motor_speeds):
-        payload = []
-        for speed in motor_speeds:
-            payload.append(speed & 0xFF)
-            payload.append((speed >> 8) & 0xFF)
-        self.send_request_msp(self.create_packet_msp(MSP_SET_MOTOR, payload))
+        self.send_request_msp(self.create_packet_msp(MSP_SET_MOTOR, motor_speeds))
 
     def write_function(self):
         """Background thread that continuously sends commands to the drone"""
@@ -427,50 +424,47 @@ class pluto:
     def get_height(self) -> float:
         """
         Get the current height of the drone.
-        
+
         Returns:
             float: Height in cm (or other unit depending on sensor).
         """
-        data = []
-        self.create_packet_msp(MSP_ALTITUDE, data) 
-        for i in range(RETRY_COUNT):
+        self.send_request_msp(self.create_packet_msp(MSP_ALTITUDE, []))
+        for _ in range(RETRY_COUNT):
             data = self.receive_packet()
-            i = 0
-            while i < len(data) and data[i] != 109:
-                i += 1
-            if i + 3 < len(data):
-                height = self.read16(data[i + 1:i + 3])
+            j = 0
+            while j < len(data) and data[j] != 109:
+                j += 1
+            if j + 3 < len(data):
+                height = self.read16(data[j + 1:j + 3])
                 print(f"height: {height} cm")
                 return height
         return 0.0
 
     def get_vario(self):
-        data = []
-        self.create_packet_msp(MSP_ALTITUDE, data) 
-        for i in range(RETRY_COUNT):
+        self.send_request_msp(self.create_packet_msp(MSP_ALTITUDE, []))
+        for _ in range(RETRY_COUNT):
             data = self.receive_packet()
-            i = 0
-            while i < len(data) and data[i] != 109:
-                i += 1
-            if i + 7 < len(data):
-                return self.read16(data[i + 5:i + 7])
+            j = 0
+            while j < len(data) and data[j] != 109:
+                j += 1
+            if j + 7 < len(data):
+                return self.read16(data[j + 5:j + 7])
 
     def get_roll(self) -> float:
         """
         Get the current Roll angle.
-        
+
         Returns:
             float: Roll angle in degrees.
         """
-        data = []
-        self.create_packet_msp(MSP_ATTITUDE, data) 
-        for i in range(RETRY_COUNT):
+        self.send_request_msp(self.create_packet_msp(MSP_ATTITUDE, []))
+        for _ in range(RETRY_COUNT):
             data = self.receive_packet()
-            i = 0
-            while i < len(data) and data[i] != 108:
-                i += 1
-            if i + 3 < len(data):
-                roll = self.read16(data[i + 1:i + 3]) / 10
+            j = 0
+            while j < len(data) and data[j] != 108:
+                j += 1
+            if j + 3 < len(data):
+                roll = self.read16(data[j + 1:j + 3]) / 10
                 print(f"roll: {roll} degrees")
                 return roll
         return 0.0
@@ -478,19 +472,18 @@ class pluto:
     def get_pitch(self) -> float:
         """
         Get the current Pitch angle.
-        
+
         Returns:
             float: Pitch angle in degrees.
         """
-        data = []
-        self.create_packet_msp(MSP_ATTITUDE, data) 
-        for i in range(RETRY_COUNT):
+        self.send_request_msp(self.create_packet_msp(MSP_ATTITUDE, []))
+        for _ in range(RETRY_COUNT):
             data = self.receive_packet()
-            i = 0
-            while i < len(data) and data[i] != 108:
-                i += 1
-            if i + 5 < len(data):
-                pitch = self.read16(data[i + 3:i + 5]) / 10
+            j = 0
+            while j < len(data) and data[j] != 108:
+                j += 1
+            if j + 5 < len(data):
+                pitch = self.read16(data[j + 3:j + 5]) / 10
                 print(f"pitch: {pitch} degrees")
                 return pitch
         return 0.0
@@ -498,148 +491,130 @@ class pluto:
     def get_yaw(self) -> float:
         """
         Get the current Yaw angle.
-        
+
         Returns:
             float: Yaw angle in degrees.
         """
-        data = []
-        self.create_packet_msp(MSP_ATTITUDE, data) 
-        for i in range(RETRY_COUNT):
+        self.send_request_msp(self.create_packet_msp(MSP_ATTITUDE, []))
+        for _ in range(RETRY_COUNT):
             data = self.receive_packet()
-            i = 0
-            while i < len(data) and data[i] != 108:
-                i += 1
-            if i + 7 < len(data):
-                yaw = self.read16(data[i + 5:i + 7])
+            j = 0
+            while j < len(data) and data[j] != 108:
+                j += 1
+            if j + 7 < len(data):
+                yaw = self.read16(data[j + 5:j + 7])
                 print(f"yaw: {yaw} degrees")
                 return float(yaw)
         return 0.0
 
     def get_acc_x(self) -> int:
         """Get raw Accelerometer X value (unsigned 16-bit)."""
-        data = []
-        self.create_packet_msp(MSP_RAW_IMU, data) 
-        for i in range(RETRY_COUNT):
+        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
+        for _ in range(RETRY_COUNT):
             data = self.receive_packet()
-            i = 0
-            while i < len(data) and data[i] != 102:
-                i += 1
-            if i + 3 < len(data):
-                return self.read16(data[i + 1:i + 3])
+            j = 0
+            while j < len(data) and data[j] != 102:
+                j += 1
+            if j + 3 < len(data):
+                return self.read16(data[j + 1:j + 3])
         return 0
 
     def get_acc_y(self) -> int:
         """Get raw Accelerometer Y value (unsigned 16-bit)."""
-        data = []
-        self.create_packet_msp(MSP_RAW_IMU, data) 
-        for i in range(RETRY_COUNT):
+        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
+        for _ in range(RETRY_COUNT):
             data = self.receive_packet()
-            i = 0
-            while i < len(data) and data[i] != 102:
-                i += 1
-            if i + 5 < len(data):
-                return self.read16(data[i + 3:i + 5])
+            j = 0
+            while j < len(data) and data[j] != 102:
+                j += 1
+            if j + 5 < len(data):
+                return self.read16(data[j + 3:j + 5])
         return 0
 
     def get_acc_z(self) -> int:
         """Get raw Accelerometer Z value (unsigned 16-bit)."""
-        data = []
-        self.create_packet_msp(MSP_RAW_IMU, data) 
-        for i in range(RETRY_COUNT):
+        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
+        for _ in range(RETRY_COUNT):
             data = self.receive_packet()
-            i = 0
-            while i < len(data) and data[i] != 102:
-                i += 1
-            if i + 7 < len(data):
-                return self.read16(data[i + 5:i + 7])
+            j = 0
+            while j < len(data) and data[j] != 102:
+                j += 1
+            if j + 7 < len(data):
+                return self.read16(data[j + 5:j + 7])
         return 0
 
     def get_gyro_x(self) -> int:
         """Get raw Gyroscope X value (unsigned 16-bit)."""
-        data = []
-        self.create_packet_msp(MSP_RAW_IMU, data) 
-        for i in range(RETRY_COUNT):
+        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
+        for _ in range(RETRY_COUNT):
             data = self.receive_packet()
-            i = 0
-            while i < len(data) and data[i] != 102:
-                i += 1
-            if i + 9 < len(data):
-                return self.read16(data[i + 7:i + 9])
+            j = 0
+            while j < len(data) and data[j] != 102:
+                j += 1
+            if j + 9 < len(data):
+                return self.read16(data[j + 7:j + 9])
         return 0
 
     def get_gyro_y(self) -> int:
         """Get raw Gyroscope Y value (unsigned 16-bit)."""
-        data = []
-        self.create_packet_msp(MSP_RAW_IMU, data) 
-        for i in range(RETRY_COUNT):
+        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
+        for _ in range(RETRY_COUNT):
             data = self.receive_packet()
-            i = 0
-            while i < len(data) and data[i] != 102:
-                i += 1
-            if i + 11 < len(data):
-                return self.read16(data[i + 9:i + 11])
+            j = 0
+            while j < len(data) and data[j] != 102:
+                j += 1
+            if j + 11 < len(data):
+                return self.read16(data[j + 9:j + 11])
         return 0
 
     def get_gyro_z(self) -> int:
         """Get raw Gyroscope Z value (unsigned 16-bit)."""
-        data = []
-        self.create_packet_msp(MSP_RAW_IMU, data) 
-        for i in range(RETRY_COUNT):
+        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
+        for _ in range(RETRY_COUNT):
             data = self.receive_packet()
-            i = 0
-            while i < len(data) and data[i] != 102:
-                i += 1
-            if i + 13 < len(data):
-                return self.read16(data[i + 11:i + 13])
+            j = 0
+            while j < len(data) and data[j] != 102:
+                j += 1
+            if j + 13 < len(data):
+                return self.read16(data[j + 11:j + 13])
         return 0
 
     def get_mag_x(self) -> int:
         """Get raw Magnetometer X value (unsigned 16-bit)."""
-        data = []
-        self.create_packet_msp(MSP_RAW_IMU, data) 
-        for i in range(RETRY_COUNT):
+        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
+        for _ in range(RETRY_COUNT):
             data = self.receive_packet()
-            i = 0
-            while i < len(data) and data[i] != 102:
-                i += 1
-            if i + 15 < len(data):
-                return self.read16(data[i + 13:i + 15])
+            j = 0
+            while j < len(data) and data[j] != 102:
+                j += 1
+            if j + 15 < len(data):
+                return self.read16(data[j + 13:j + 15])
         return 0
 
     def get_mag_y(self) -> int:
         """Get raw Magnetometer Y value (unsigned 16-bit)."""
-        data = []
-        self.create_packet_msp(MSP_RAW_IMU, data) 
-        for i in range(RETRY_COUNT):
+        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
+        for _ in range(RETRY_COUNT):
             data = self.receive_packet()
-            i = 0
-            while i < len(data) and data[i] != 102:
-                i += 1
-            if i + 17 < len(data):
-                return self.read16(data[i + 15:i + 17])
+            j = 0
+            while j < len(data) and data[j] != 102:
+                j += 1
+            if j + 17 < len(data):
+                return self.read16(data[j + 15:j + 17])
         return 0
 
     def get_mag_z(self) -> int:
         """Get raw Magnetometer Z value (unsigned 16-bit)."""
-        data = []
-        self.create_packet_msp(MSP_RAW_IMU, data) 
-        for i in range(RETRY_COUNT):
+        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
+        for _ in range(RETRY_COUNT):
             data = self.receive_packet()
-            i = 0
-            while i < len(data) and data[i] != 102:
-                i += 1
-            if i + 19 < len(data):
-                return self.read16(data[i + 17:i + 19])
+            j = 0
+            while j < len(data) and data[j] != 102:
+                j += 1
+            if j + 19 < len(data):
+                return self.read16(data[j + 17:j + 19])
         return 0
 
-    def calibrate_acceleration(self):
-        self.create_packet_msp(MSP_ACC_CALIBRATION, [])
-        time.sleep(5)  # Adjust sleep duration based on calibration time
-        acc_x = self.get_acc_x()
-        acc_y = self.get_acc_y()
-        acc_z = self.get_acc_z()
-        print("Calibrated Accelerometer Values:")
-        print(f"X-Axis: {acc_x}, Y-Axis: {acc_y}, Z-Axis: {acc_z}")
     def calibrate_acceleration(self) -> None:
         """
         Calibrate the Accelerometer.
@@ -661,38 +636,37 @@ class pluto:
     def get_battery(self) -> float:
         """
         Get the current battery voltage.
-        
+
         Returns:
             float: Battery voltage in Volts.
         """
-        data = []
-        self.create_packet_msp(MSP_ANALOG, data) 
-        for i in range(RETRY_COUNT):
+        self.send_request_msp(self.create_packet_msp(MSP_ANALOG, []))
+        for _ in range(RETRY_COUNT):
             data = self.receive_packet()
-            i = 0
-            while i < len(data) and data[i] != 110:
-                i += 1
-            if i + 1 < len(data):
-                return self.read8(data[i + 1]) / 10.0
+            j = 0
+            while j < len(data) and data[j] != 110:
+                j += 1
+            if j + 1 < len(data):
+                return self.read8(data[j + 1]) / 10.0
         return 0.0
 
     def get_battery_percentage(self) -> float:
         """
         Get the current battery percentage (estimated).
-        
+
         Returns:
-            float: Battery percentage (0.0 to 100.0).
+            float: Battery percentage (0.0 to 100.0), clamped.
         """
-        data = []
-        self.create_packet_msp(MSP_ANALOG, data)
-        for i in range(RETRY_COUNT):
+        self.send_request_msp(self.create_packet_msp(MSP_ANALOG, []))
+        for _ in range(RETRY_COUNT):
             data = self.receive_packet()
-            i = 0 
-            while i < len(data) and data[i] != 110:
-                i += 1
-            if i+1 < len(data):
-                voltage = self.read8(data[i+1]) / 10.0
-                return ((voltage - 3.7) / (4.2 - 3.7)) * 100
+            j = 0
+            while j < len(data) and data[j] != 110:
+                j += 1
+            if j + 1 < len(data):
+                voltage = self.read8(data[j + 1]) / 10.0
+                percentage = ((voltage - 3.7) / (4.2 - 3.7)) * 100
+                return max(0.0, min(100.0, percentage))
         return 0.0
             
     # Removed enable_raw_log function as per request for simplicity
@@ -747,7 +721,7 @@ class pluto:
                     if self.debug_buffer[i] == 10: # \n
                         idx_newline = i
                         break
-            except: 
+            except Exception:
                 pass
 
             # Decision Logic: Process whichever comes first, or process text if no MSP
@@ -761,10 +735,10 @@ class pluto:
                         line = line_data.decode('utf-8', errors='ignore').strip()
                         if line and len(line) > 1 and not line.startswith('$'):
                             print(f"[SERIAL] {line}")
-                    except: pass
+                    except Exception: pass
                     self.debug_buffer = self.debug_buffer[idx_newline+1:]
                     continue
-                
+
                 # Process MSP Packet
                 if idx_msp + 3 <= len(self.debug_buffer):
                     payload_size = self.debug_buffer[idx_msp+2]
@@ -778,7 +752,7 @@ class pluto:
                             if debug_msg and not debug_msg.startswith('~'):
                                 timestamp = time.strftime("%H:%M:%S")
                                 print(f"[DEBUG {timestamp}] {debug_msg}")
-                        except:
+                        except Exception:
                             pass
                         
                         # Remove packet
@@ -801,7 +775,7 @@ class pluto:
                         # Ensure it's not a fragment of another MSP command
                         if not line.startswith('$M'): 
                              print(f"[SERIAL] {line}")
-                except: pass
+                except Exception: pass
                 self.debug_buffer = self.debug_buffer[idx_newline+1:]
                 continue
                 
@@ -875,37 +849,6 @@ class pluto:
         
         return telemetry
     
-    def get_battery_info(self) -> Optional[Dict[str, Union[str, int, float, str]]]:
-        """
-        Get comprehensive battery information.
-        
-        Returns:
-            dict: Dictionary containing battery telemetry.
-                  Structure depends on MSP_Protocol_Version.
-        """
-        telemetry = self.get_analog_telemetry()
-        if not telemetry:
-            return None
-            
-        if self.MSP_Protocol_Version == 1:
-             return {
-                'voltage': f"{telemetry['vBatComp']:.2f}V",
-                'current': f"{telemetry['mAmpRaw']}mA",
-                'capacity_drawn': f"{telemetry['mAhDrawn']}mAh",
-                'capacity_remaining': f"{telemetry['mAhRemain']}mAh",
-                'state_of_charge': f"{telemetry['soc_Fused']}%",
-                'auto_land_mode': telemetry['auto_LandMode'],
-                'protocol': "V1 (Enhanced)"
-            }
-        else:
-             return {
-                'voltage': f"{telemetry['bytevbat']:.2f}V",
-                'current': f"{telemetry.get('amperage', 0)}mA",
-                'rssi': telemetry['rssi'],
-                'power_sum': telemetry['pMeterSum'],
-                'protocol': "Legacy"
-            }
-
     def get_battery_voltage_compensated(self) -> float:
         """Get compensated battery voltage (Volts)."""
         self.get_analog_telemetry()

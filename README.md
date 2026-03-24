@@ -303,7 +303,6 @@ battery_info = pluto.get_battery_info()
 #     'state_of_charge': '75%',
 #     'auto_land_mode': 0,
 #     'protocol': 'V1 (Enhanced)'
-#     'protocol': 'V1 (Enhanced)'
 # }
 ```
 
