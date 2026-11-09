@@ -517,9 +517,11 @@ class Pluto:
         Set the height the drone holds, in cm (needs MagisV2 firmware with MSP 227).
 
         Works like setDesiredPosition(Z, cm) in PlutoPilot.cpp: the drone climbs or
-        descends to the new height smoothly and holds it. Keep the throttle centred
-        (reset() sets 1500): moving the throttle stick takes over from the target, and
-        take_off() leaves the throttle at 1800. A max-altitude ceiling still applies.
+        descends to the new height smoothly and holds it. Call it after take-off: take-off
+        sets its own target (120 cm) and replaces an earlier one. Keep the throttle
+        centred (reset() sets 1500): moving the throttle stick takes over from the
+        target, and take_off() leaves the throttle at 1800. A max-altitude ceiling
+        still applies.
 
         Sent by the background thread in place of one telemetry request, like the LED
         commands. Calling it again before it has gone out replaces the pending value, so
