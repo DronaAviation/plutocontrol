@@ -1,4 +1,5 @@
 import socket
+from collections import deque
 from threading import Thread, Lock, Event
 import time
 from typing import Optional, List, Dict, Union, Any
@@ -33,6 +34,13 @@ MSP_SET_COMMAND = 217
 MSP_SET_1WIRE = 243
 MSP_VARIO = 122  # Example MSP command for vario (check your drone's documentation for the correct value)
 RETRY_COUNT = 3
+
+# WS2812B RGB LED strip (needs MagisV2 firmware with MSP 225 / 226)
+MSP_SET_RGB_LED = 225   # [index, r, g, b, brightness %], index 0xFF = all LEDs
+MSP_RGB_LED_CTRL = 226  # [op, count]: op 1 = take the strip, op 0 = release
+RGB_LED_ALL = 0xFF
+RGB_MAX_LEDS = 64
+LED_QUEUE_MAX = 64      # queued LED packets before set_led() waits for the drone
 
 class Pluto:
     def __init__(self, ip='192.168.4.1', port=23):
@@ -78,6 +86,9 @@ class Pluto:
         
         # Thread safety
         self._lock = Lock()  # Protects shared state (RC values, command_type)
+        self._send_lock = Lock()  # One packet at a time on the socket (writer thread + user calls)
+        self._led_queue = deque()  # LED packets, sent by write_function one per cycle
+        self._led_inflight = False  # write_function has popped an LED packet and not sent it yet
         self._stop_event = Event()  # Signals thread to stop
         self.thread = None
         self.client = None
@@ -127,6 +138,11 @@ class Pluto:
         Cleanly closes the socket and releases resources.
         """
         if self.connected:
+            # Let queued LED packets (e.g. a final led_release) go out first
+            if self._led_queue or self._led_inflight:
+                # ~22 ms per packet; allow 50 ms each for slow timers / Wi-Fi
+                self.wait_leds(timeout=0.5 + 0.05 * len(self._led_queue))
+            self._led_queue.clear()
             self.connected = False
             self._stop_event.set()  # Signal thread to stop
             
@@ -323,6 +339,106 @@ class Pluto:
         else:
             print("Invalid motor index. Must be between 0 and 3.")
 
+    # ── WS2812B RGB LEDs ────────────────────────────────────────────────────
+    # Needs MagisV2 firmware with MSP 225 / 226. Packets are queued and sent by the
+    # background thread at most one per ~22 ms cycle (~45 per second), in place of a
+    # telemetry request, so LED traffic never adds to the drone's MSP load. Calls
+    # return at once; wait_leds() waits until everything queued has been sent.
+
+    @staticmethod
+    def _in_range(name: str, value, low: int, high: int) -> bool:
+        if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high:
+            return True
+        print(f"Invalid {name} {value!r}. Must be an integer {low}-{high}.")
+        return False
+
+    def _writer_alive(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+    def _queue_led_packet(self, msp: int, payload: List[int]) -> bool:
+        if not self.connected:
+            print("Error: Not connected to server")
+            return False
+        if not self._writer_alive():
+            print("Error: background communication thread is not running (connection lost?)")
+            return False
+        # Back-pressure: a tight loop of set_led() runs at the drone's pace instead of
+        # building an ever-growing backlog.
+        deadline = time.monotonic() + 1.0
+        while len(self._led_queue) >= LED_QUEUE_MAX:
+            if time.monotonic() > deadline or not self.connected or not self._writer_alive():
+                print("Error: LED queue full, command dropped")
+                return False
+            time.sleep(0.005)
+        self._led_queue.append(self.create_packet_msp_u8(msp, payload))
+        return True
+
+    def led_init(self, count: int) -> None:
+        """
+        Take control of the WS2812B LED strip from the drone.
+
+        Until led_release() or a reboot, the drone's own LED colours and the RGB calls in
+        PlutoPilot.cpp are ignored. If PlutoPilot.cpp never called RGB_Init, the drone
+        starts the strip on PA8 with `count` LEDs.
+
+        The drone silently ignores led_init (and later set_led calls) when it has to start
+        the strip itself and: it is armed, a PPM receiver is used, PA8 is already set up
+        by PlutoPilot.cpp (output, PWM or pull-up/down), or the strip's DMA channel is busy.
+        Call led_init before arming.
+
+        Args:
+            count (int): Number of LEDs on the strip (1-64).
+        """
+        if self._in_range("LED count", count, 1, RGB_MAX_LEDS):
+            self._queue_led_packet(MSP_RGB_LED_CTRL, [1, count])
+
+    def set_led(self, index: int, r: int, g: int, b: int, brightness: int = 100) -> None:
+        """
+        Set the colour of one LED (needs led_init first).
+
+        Args:
+            index (int): LED index (0 to count-1).
+            r, g, b (int): Colour, 0-255 each.
+            brightness (int): 0-100 %, applied to this colour only (default 100).
+        """
+        if (self._in_range("LED index", index, 0, RGB_MAX_LEDS - 1)
+                and self._in_range("red", r, 0, 255) and self._in_range("green", g, 0, 255)
+                and self._in_range("blue", b, 0, 255)
+                and self._in_range("brightness", brightness, 0, 100)):
+            self._queue_led_packet(MSP_SET_RGB_LED, [index, r, g, b, brightness])
+
+    def set_all_leds(self, r: int, g: int, b: int, brightness: int = 100) -> None:
+        """
+        Set every LED to one colour with a single packet (needs led_init first).
+
+        Args:
+            r, g, b (int): Colour, 0-255 each.
+            brightness (int): 0-100 % (default 100).
+        """
+        if (self._in_range("red", r, 0, 255) and self._in_range("green", g, 0, 255)
+                and self._in_range("blue", b, 0, 255)
+                and self._in_range("brightness", brightness, 0, 100)):
+            self._queue_led_packet(MSP_SET_RGB_LED, [RGB_LED_ALL, r, g, b, brightness])
+
+    def led_release(self) -> None:
+        """Turn the strip off and give it back to the drone / PlutoPilot.cpp."""
+        self._led_queue.clear()  # colours still queued would be blanked anyway: release goes next
+        self._queue_led_packet(MSP_RGB_LED_CTRL, [0, 0])
+
+    def wait_leds(self, timeout: float = 3.0) -> bool:
+        """
+        Wait until all queued LED packets have been sent.
+
+        Returns:
+            bool: True if everything was sent within `timeout` seconds.
+        """
+        deadline = time.monotonic() + timeout
+        while (self._led_queue or self._led_inflight) and self.connected and self._writer_alive():
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.01)
+        return not self._led_queue and not self._led_inflight
+
     def trim(self, roll: int, pitch: int) -> None:
         """
         Set ACC Trim values.
@@ -339,7 +455,10 @@ class Pluto:
             
     def send_request_msp(self, data):
        if self.connected:
-           self.client.send(bytes.fromhex(data))
+           # sendall: send() may write part of a packet; the lock keeps packets from the
+           # writer thread and from user calls from interleaving on the socket.
+           with self._send_lock:
+               self.client.sendall(bytes.fromhex(data))
        else:
            if not hasattr(self, 'connection_error_logged'):
                print("Error: Not connected to server")
@@ -375,6 +494,15 @@ class Pluto:
 
         return bf
 
+    def create_packet_msp_u8(self, msp, payload):
+        """MSP v1 packet (hex string) whose payload is bytes (0-255), not 16-bit values."""
+        checksum = len(payload) ^ msp
+        bf = MSP_HEADER_IN + '{:02x}{:02x}'.format(len(payload) & 0xFF, msp & 0xFF)
+        for k in payload:
+            bf += '{:02x}'.format(k & 0xFF)
+            checksum ^= k & 0xFF
+        return bf + '{:02x}'.format(checksum & 0xFF)
+
     def send_request_msp_set_raw_rc(self, channels):
         self.send_request_msp(self.create_packet_msp(MSP_SET_RAW_RC, channels))
 
@@ -403,6 +531,7 @@ class Pluto:
     def write_function(self):
         """Background thread that continuously sends commands to the drone"""
         requests = [MSP_RC, MSP_ATTITUDE, MSP_RAW_IMU, MSP_ALTITUDE, MSP_ANALOG]
+        led_skip = 0  # telemetry request that gives its slot to the next LED packet
         self.send_request_msp_acc_trim()
 
         while self.connected and not self._stop_event.is_set():
@@ -415,7 +544,29 @@ class Pluto:
 
             # Send commands (outside lock to avoid blocking user code)
             self.send_request_msp_set_raw_rc(self.droneRC)
-            self.send_request_msp_get_debug(requests)
+
+            # A queued LED packet replaces one telemetry request (rotating), so this loop
+            # still sends 6 packets per cycle. The drone serves one MSP command per 3.5 ms
+            # loop (~285/s) and overwrites its 256-byte receive buffer when it falls behind,
+            # which would garble the RC frames above.
+            cycle_requests = requests
+            led_packet = None
+            if self._led_queue:
+                self._led_inflight = True  # set before popleft, so wait_leds never sees "empty and idle" early
+                try:
+                    led_packet = self._led_queue.popleft()
+                except IndexError:
+                    led_packet = None
+            if led_packet is not None:
+                try:
+                    self.send_request_msp(led_packet)
+                finally:
+                    self._led_inflight = False
+                cycle_requests = requests[:led_skip] + requests[led_skip + 1:]
+                led_skip = (led_skip + 1) % len(requests)
+            else:
+                self._led_inflight = False
+            self.send_request_msp_get_debug(cycle_requests)
             if cmd_to_send != self.NONE_COMMAND:
                 self.send_request_msp_set_command(cmd_to_send)
 
