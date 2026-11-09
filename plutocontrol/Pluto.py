@@ -47,6 +47,17 @@ LED_QUEUE_MAX = 64      # queued LED packets before set_led() waits for the dron
 MSP_SET_ALT_HOLD = 227  # [int32 cm]: same as setDesiredPosition(Z, cm) in PlutoPilot.cpp
 HEIGHT_MAX_CM = 10000   # 100 m: catches values passed in mm by mistake
 
+MSP_MOTOR_COUNT = 8     # MSP_SET_MOTOR always carries 8 motors (the firmware reads 8)
+
+# Why the drone may refuse these ($M!). Firmware without the plutocontrol extensions
+# (225-227) refuses them as unknown and nothing else happens; other functions still work.
+REJECT_HINTS = {
+    MSP_SET_RGB_LED: "LED colour: needs firmware with MSP 225/226, and led_init() first",
+    MSP_RGB_LED_CTRL: "LED strip: needs firmware with MSP 225/226; disarm first, PA8 must be free",
+    MSP_SET_ALT_HOLD: "set_height: needs firmware with MSP 227",
+    MSP_EEPROM_WRITE: "EEPROM write: refused while armed",
+}
+
 class Pluto:
     def __init__(self, ip='192.168.4.1', port=23):
         # RC channel values
@@ -405,8 +416,7 @@ class Pluto:
             motor_speeds = [1000, 1000, 1000, 1000]
             motor_speeds[index] = value
             
-            # create_packet_msp takes a list of 16-bit integers
-            self.send_request_msp(self.create_packet_msp(MSP_SET_MOTOR, motor_speeds))
+            self.send_request_msp_set_motor(motor_speeds)  # padded to the 8 motors the firmware reads
         else:
             print("Invalid motor index. Must be between 0 and 3.")
 
@@ -570,30 +580,24 @@ class Pluto:
             return False
 
     def create_packet_msp(self, msp, payload):
+        """MSP v1 packet (hex string) whose payload is 16-bit little-endian values."""
         bf = ""
         bf += MSP_HEADER_IN
 
         checksum = 0
-        if (msp == MSP_SET_COMMAND):
-            pl_size = 1
-        else:
-            pl_size = len(payload) * 2
+        pl_size = len(payload) * 2
 
         bf += '{:02x}'.format(pl_size & 0xFF)
-        checksum ^= pl_size
+        checksum ^= pl_size & 0xFF
 
         bf += '{:02x}'.format(msp & 0xFF)
-        checksum ^= msp
+        checksum ^= msp & 0xFF
 
         for k in payload:
-            if (msp == MSP_SET_COMMAND):
-                bf += '{:02x}'.format(k & 0xFF)
-                checksum ^= k & 0xFF
-            else:
-                bf += '{:02x}'.format(k & 0xFF)
-                checksum ^= k & 0xFF
-                bf += '{:02x}'.format((k >> 8) & 0xFF)
-                checksum ^= (k >> 8) & 0xFF
+            bf += '{:02x}'.format(k & 0xFF)
+            checksum ^= k & 0xFF
+            bf += '{:02x}'.format((k >> 8) & 0xFF)
+            checksum ^= (k >> 8) & 0xFF
 
         bf += '{:02x}'.format(checksum)
 
@@ -612,6 +616,8 @@ class Pluto:
         self.send_request_msp(self.create_packet_msp(MSP_SET_RAW_RC, channels))
 
     def send_request_msp_set_command(self, command_type):
+        # 16-bit, because every Magis / MagisV2 firmware reads it with read16 ( ). A 1-byte
+        # payload only worked because current_command happens to be uint8 there.
         self.send_request_msp(self.create_packet_msp(MSP_SET_COMMAND, [command_type]))
 
     def send_request_msp_get_debug(self, requests):
@@ -633,7 +639,11 @@ class Pluto:
         self.send_request_msp(self.create_packet_msp(MSP_EEPROM_WRITE, []))
 
     def send_request_msp_set_motor(self, motor_speeds):
-        self.send_request_msp(self.create_packet_msp(MSP_SET_MOTOR, motor_speeds))
+        # The firmware always reads 8 motors; pad with idle so motors 5-8 never get
+        # leftover bytes from an earlier packet.
+        speeds = list(motor_speeds)[:MSP_MOTOR_COUNT]
+        speeds += [1000] * (MSP_MOTOR_COUNT - len(speeds))
+        self.send_request_msp(self.create_packet_msp(MSP_SET_MOTOR, speeds))
 
     def write_function(self):
         """Background thread that continuously sends commands to the drone"""
@@ -869,6 +879,8 @@ class Pluto:
         silent_seconds = 0
         while self.connected and not self._stop_event.is_set():
             client = self.client
+            if client is None:
+                break
             try:
                 data = client.recv(4096)
             except socket.timeout:
@@ -933,8 +945,7 @@ class Pluto:
                     self._store_frame(cmd, payload)
                 elif cmd not in self._rejected_cmds:
                     self._rejected_cmds.add(cmd)
-                    print(f"Drone rejected MSP command {cmd} "
-                          "(not supported by this firmware, or not allowed right now)")
+                    self._report_rejected(cmd)
                 i = end
             elif kind == 0x44:  # 'D': $D size message checksum, from debugPrint()
                 if n - start < 3:
@@ -951,6 +962,13 @@ class Pluto:
                 self._serial_text(buf[start:start + 1])
                 i = start + 1
         del buf[:i]
+
+    def _report_rejected(self, cmd: int) -> None:
+        """Say once per connection that the drone refused `cmd` ($M!), and why it may have."""
+        if cmd == MSP_ACC_TRIM:
+            return  # trim read sent at start-up; its reply is not used
+        hint = REJECT_HINTS.get(cmd, "not supported by this firmware, or not allowed right now")
+        print(f"Drone rejected MSP command {cmd} ({hint})")
 
     def _store_frame(self, cmd: int, payload: bytes) -> None:
         with self._frames_cv:
