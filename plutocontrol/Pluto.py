@@ -43,6 +43,10 @@ RGB_LED_ALL = 0xFF
 RGB_MAX_LEDS = 64
 LED_QUEUE_MAX = 64      # queued LED packets before set_led() waits for the drone
 
+# Altitude-hold target (needs MagisV2 firmware with MSP 227)
+MSP_SET_ALT_HOLD = 227  # [int32 cm]: same as setDesiredPosition(Z, cm) in PlutoPilot.cpp
+HEIGHT_MAX_CM = 10000   # 100 m: catches values passed in mm by mistake
+
 class Pluto:
     def __init__(self, ip='192.168.4.1', port=23):
         # RC channel values
@@ -90,6 +94,7 @@ class Pluto:
         self._send_lock = Lock()  # One packet at a time on the socket (writer thread + user calls)
         self._led_queue = deque()  # LED packets, sent by write_function one per cycle
         self._led_inflight = False  # write_function has popped an LED packet and not sent it yet
+        self._pending_height = None  # set_height() target (cm) not sent yet; a newer call replaces it
         self._stop_event = Event()  # Signals thread to stop
         self.thread = None
         self.client = None
@@ -182,6 +187,7 @@ class Pluto:
                 self._rejected_cmds.clear()
                 self._led_queue.clear()
                 self._led_inflight = False
+                self._pending_height = None
                 self._not_connected_logged = False
                 self.connected = True
                 print(f"Connected to drone at {self.TCP_IP}:{self.TCP_PORT}")
@@ -502,6 +508,32 @@ class Pluto:
             time.sleep(0.01)
         return not self._led_queue and not self._led_inflight
 
+    # ── Altitude hold target ────────────────────────────────────────────────
+
+    def set_height(self, height_cm: int) -> None:
+        """
+        Set the height the drone holds, in cm (needs MagisV2 firmware with MSP 227).
+
+        Works like setDesiredPosition(Z, cm) in PlutoPilot.cpp: the drone climbs or
+        descends to the new height smoothly and holds it. Keep the throttle centred
+        (reset() sets 1500): moving the throttle stick takes over from the target, and
+        take_off() leaves the throttle at 1800. A max-altitude ceiling still applies.
+
+        Sent by the background thread in place of one telemetry request, like the LED
+        commands. Calling it again before it has gone out replaces the pending value, so
+        calling it in a loop never builds a backlog.
+
+        Args:
+            height_cm (int): Target height in cm (0-10000).
+        """
+        if not self._in_range("height", height_cm, 0, HEIGHT_MAX_CM):
+            return
+        if not self.connected:
+            self._warn_not_connected()
+            return
+        with self._lock:
+            self._pending_height = height_cm
+
     def trim(self, roll: int, pitch: int) -> None:
         """
         Set ACC Trim values.
@@ -610,7 +642,7 @@ class Pluto:
 
     def _write_loop(self):
         requests = [MSP_RC, MSP_ATTITUDE, MSP_RAW_IMU, MSP_ALTITUDE, MSP_ANALOG]
-        led_skip = 0  # telemetry request that gives its slot to the next LED packet
+        slot_skip = 0  # telemetry request that gives its slot to the next height / LED packet
         self.send_request_msp_acc_trim()
 
         while self.connected and not self._stop_event.is_set():
@@ -620,29 +652,35 @@ class Pluto:
                 cmd_to_send = self.command_type
                 if cmd_to_send != self.NONE_COMMAND:
                     self.command_type = self.NONE_COMMAND
+                height_to_send = self._pending_height
+                self._pending_height = None
 
             # Send commands (outside lock to avoid blocking user code)
             self.send_request_msp_set_raw_rc(self.droneRC)
 
-            # A queued LED packet replaces one telemetry request (rotating), so this loop
-            # still sends 6 packets per cycle. The drone serves one MSP command per 3.5 ms
-            # loop (~285/s) and overwrites its 256-byte receive buffer when it falls behind,
-            # which would garble the RC frames above.
+            # A height target or a queued LED packet replaces one telemetry request
+            # (rotating), so this loop still sends 6 packets per cycle. The drone serves one
+            # MSP command per 3.5 ms loop (~285/s) and overwrites its 256-byte receive buffer
+            # when it falls behind, which would garble the RC frames above.
             cycle_requests = requests
-            led_packet = None
-            if self._led_queue:
+            slot_packet = None
+            if height_to_send is not None:
+                # Height goes first: it matters for flight, LED colours can wait a cycle
+                slot_packet = self.create_packet_msp_u8(
+                    MSP_SET_ALT_HOLD, list(height_to_send.to_bytes(4, 'little', signed=True)))
+            elif self._led_queue:
                 self._led_inflight = True  # set before popleft, so wait_leds never sees "empty and idle" early
                 try:
-                    led_packet = self._led_queue.popleft()
+                    slot_packet = self._led_queue.popleft()
                 except IndexError:
-                    led_packet = None
-            if led_packet is not None:
+                    slot_packet = None
+            if slot_packet is not None:
                 try:
-                    self.send_request_msp(led_packet)
+                    self.send_request_msp(slot_packet)
                 finally:
                     self._led_inflight = False
-                cycle_requests = requests[:led_skip] + requests[led_skip + 1:]
-                led_skip = (led_skip + 1) % len(requests)
+                cycle_requests = requests[:slot_skip] + requests[slot_skip + 1:]
+                slot_skip = (slot_skip + 1) % len(requests)
             else:
                 self._led_inflight = False
             self.send_request_msp_get_debug(cycle_requests)
