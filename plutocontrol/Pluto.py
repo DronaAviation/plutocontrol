@@ -1,6 +1,6 @@
 import socket
 from collections import deque
-from threading import Thread, Lock, Event
+from threading import Thread, Lock, Event, Condition, current_thread
 import time
 from typing import Optional, List, Dict, Union, Any
 
@@ -34,6 +34,7 @@ MSP_SET_COMMAND = 217
 MSP_SET_1WIRE = 243
 MSP_VARIO = 122  # Example MSP command for vario (check your drone's documentation for the correct value)
 RETRY_COUNT = 3
+FRAME_MAX_AGE = 0.5  # seconds: getters wait for a newer reply than this
 
 # WS2812B RGB LED strip (needs MagisV2 firmware with MSP 225 / 226)
 MSP_SET_RGB_LED = 225   # [index, r, g, b, brightness %], index 0xFF = all LEDs
@@ -92,19 +93,69 @@ class Pluto:
         self._stop_event = Event()  # Signals thread to stop
         self.thread = None
         self.client = None
-        
+
+        # Receiving (reader thread)
+        self.reader_thread = None
+        self._rx_buf = bytearray()     # received bytes not yet parsed into frames
+        self._rx_text = bytearray()    # raw serial text waiting for a newline (dev mode)
+        self._frames = {}              # MSP command -> (latest reply payload, time received)
+        self._frames_cv = Condition()  # wakes getters waiting for a new reply
+        self._rejected_cmds = set()    # MSP commands the drone answered with an error
+        self._not_connected_logged = False
+
         # Developer Mode (Serial Debug)
         self.dev_mode_enabled = False
-        self.debug_buffer = bytearray()
 
 
 
     def start_write_function(self):
-        """Start the background communication thread"""
+        """Start the background threads: the writer (RC + requests) and the reader (replies)."""
+        self._stop_event.clear()
         if self.thread is None or not self.thread.is_alive():
-            self._stop_event.clear()
             self.thread = Thread(target=self.write_function, daemon=True)
             self.thread.start()
+        if self.reader_thread is None or not self.reader_thread.is_alive():
+            self.reader_thread = Thread(target=self._read_function, daemon=True)
+            self.reader_thread.start()
+
+    def _join_threads(self, timeout: float = 1.5) -> None:
+        """Wait for the background threads of a previous link to finish."""
+        for t in (self.thread, self.reader_thread):
+            if t is not None and t.is_alive() and t is not current_thread():
+                t.join(timeout=timeout)
+
+    def _close_socket(self) -> None:
+        if self.client:
+            try:
+                self.client.shutdown(socket.SHUT_RDWR)  # wakes a thread blocked in recv
+            except OSError:
+                pass
+            try:
+                self.client.close()
+            except OSError:
+                pass
+
+    def _warn_not_connected(self) -> None:
+        if not self._not_connected_logged:
+            print("Error: Not connected to server")
+            self._not_connected_logged = True
+
+    def _link_lost(self, reason) -> None:
+        """
+        Mark the link as down after a socket error (in a background thread or a send).
+
+        Stops both threads and closes the socket, so `connected` is False and later
+        calls report it instead of silently doing nothing. connect() starts a new link.
+        """
+        with self._lock:
+            if not self.connected:
+                return  # already handled, or disconnect() is closing the socket
+            self.connected = False
+        self._stop_event.set()
+        print(f"Connection to drone lost ({reason}). Call connect() to reconnect.")
+        self._close_socket()
+        with self._frames_cv:
+            self._frames_cv.notify_all()
         
     def connect(self) -> None:
         """
@@ -117,20 +168,32 @@ class Pluto:
             socket.timeout: If connection fails to establish within 5 seconds.
         """
         if not self.connected:
+            self._join_threads()  # threads of a lost link may still be finishing
             self.client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client.settimeout(5.0)  # 5 second timeout for connection
             try:
                 self.client.connect((self.TCP_IP, self.TCP_PORT))
-                self.client.settimeout(1.0)  # 1 second timeout for reads
+                self.client.settimeout(1.0)  # 1 second timeout for reads and sends
+                # Nothing from a previous link carries over
+                with self._frames_cv:
+                    self._frames.clear()
+                self._rx_buf.clear()
+                self._rx_text.clear()
+                self._rejected_cmds.clear()
+                self._led_queue.clear()
+                self._led_inflight = False
+                self._not_connected_logged = False
                 self.connected = True
                 print(f"Connected to drone at {self.TCP_IP}:{self.TCP_PORT}")
                 self.start_write_function()
             except socket.timeout:
                 print(f"Connection timeout: Unable to connect to {self.TCP_IP}:{self.TCP_PORT}")
                 self.connected = False
+                self._close_socket()
             except Exception as e:
                 print(f"Error connecting to server: {e}")
                 self.connected = False
+                self._close_socket()
 
     def disconnect(self) -> None:
         """
@@ -146,17 +209,17 @@ class Pluto:
             self.connected = False
             self._stop_event.set()  # Signal thread to stop
             
-            # Wait for thread to finish (with timeout)
+            # Wait for the writer to finish (with timeout)
             if self.thread and self.thread.is_alive():
                 self.thread.join(timeout=1.0)
-            
-            # Close socket
-            if self.client:
-                try:
-                    self.client.close()
-                except Exception:
-                    pass
-            
+
+            # Close the socket (this also wakes the reader), then wait for the reader
+            self._close_socket()
+            if self.reader_thread and self.reader_thread.is_alive():
+                self.reader_thread.join(timeout=1.0)
+            with self._frames_cv:
+                self._frames_cv.notify_all()
+
             print("Disconnected from drone")
 
     def cam(self) -> None:
@@ -455,16 +518,20 @@ class Pluto:
         pitch = max(min(pitch, TRIM_MAX), TRIM_MIN)
         self.send_request_msp_set_acc_trim(roll, pitch)
             
-    def send_request_msp(self, data):
-       if self.connected:
-           # sendall: send() may write part of a packet; the lock keeps packets from the
-           # writer thread and from user calls from interleaving on the socket.
-           with self._send_lock:
-               self.client.sendall(bytes.fromhex(data))
-       else:
-           if not hasattr(self, 'connection_error_logged'):
-               print("Error: Not connected to server")
-               self.connection_error_logged = True
+    def send_request_msp(self, data) -> bool:
+        """Send one MSP packet (hex string). Returns False if it could not be sent."""
+        if not self.connected:
+            self._warn_not_connected()
+            return False
+        try:
+            # sendall: send() may write part of a packet; the lock keeps packets from the
+            # writer thread and from user calls from interleaving on the socket.
+            with self._send_lock:
+                self.client.sendall(bytes.fromhex(data))
+            return True
+        except OSError as e:  # includes socket.timeout
+            self._link_lost(e)
+            return False
 
     def create_packet_msp(self, msp, payload):
         bf = ""
@@ -534,6 +601,14 @@ class Pluto:
 
     def write_function(self):
         """Background thread that continuously sends commands to the drone"""
+        try:
+            self._write_loop()
+        except Exception as e:
+            # Never die silently: the drone would stop getting RC frames while
+            # `connected` still said True.
+            self._link_lost(f"writer thread error: {e!r}")
+
+    def _write_loop(self):
         requests = [MSP_RC, MSP_ATTITUDE, MSP_RAW_IMU, MSP_ALTITUDE, MSP_ANALOG]
         led_skip = 0  # telemetry request that gives its slot to the next LED packet
         self.send_request_msp_acc_trim()
@@ -576,34 +651,33 @@ class Pluto:
 
             time.sleep(0.022)  # ~45Hz update rate
 
-    def get_height(self) -> float:
+    # ── Telemetry ───────────────────────────────────────────────────────────
+    # The writer thread asks for RC, ATTITUDE, RAW_IMU, ALTITUDE and ANALOG every cycle
+    # and the reader thread keeps the latest reply of each, so these getters add no MSP
+    # traffic and always return current data.
+
+    def get_height(self) -> int:
         """
         Get the current height of the drone.
 
         Returns:
-            float: Height in cm (or other unit depending on sensor).
+            int: Estimated altitude in cm (0 if no data).
         """
-        self.send_request_msp(self.create_packet_msp(MSP_ALTITUDE, []))
-        for _ in range(RETRY_COUNT):
-            data = self.receive_packet()
-            j = 0
-            while j < len(data) and data[j] != 109:
-                j += 1
-            if j + 3 < len(data):
-                height = self.read16(data[j + 1:j + 3])
-                print(f"height: {height} cm")
-                return height
-        return 0.0
+        height = self._field(MSP_ALTITUDE, 0, 4)  # int32, cm
+        if height is None:
+            return 0
+        print(f"height: {height} cm")
+        return height
 
-    def get_vario(self):
-        self.send_request_msp(self.create_packet_msp(MSP_ALTITUDE, []))
-        for _ in range(RETRY_COUNT):
-            data = self.receive_packet()
-            j = 0
-            while j < len(data) and data[j] != 109:
-                j += 1
-            if j + 7 < len(data):
-                return self.read16(data[j + 5:j + 7])
+    def get_vario(self) -> int:
+        """
+        Get the vertical speed.
+
+        Returns:
+            int: Variometer reading in cm/s (0 if no data).
+        """
+        vario = self._field(MSP_ALTITUDE, 4)
+        return 0 if vario is None else vario
 
     def get_roll(self) -> float:
         """
@@ -612,17 +686,12 @@ class Pluto:
         Returns:
             float: Roll angle in degrees.
         """
-        self.send_request_msp(self.create_packet_msp(MSP_ATTITUDE, []))
-        for _ in range(RETRY_COUNT):
-            data = self.receive_packet()
-            j = 0
-            while j < len(data) and data[j] != 108:
-                j += 1
-            if j + 3 < len(data):
-                roll = self.read16(data[j + 1:j + 3]) / 10
-                print(f"roll: {roll} degrees")
-                return roll
-        return 0.0
+        roll = self._field(MSP_ATTITUDE, 0)  # deci-degrees
+        if roll is None:
+            return 0.0
+        roll = roll / 10
+        print(f"roll: {roll} degrees")
+        return roll
 
     def get_pitch(self) -> float:
         """
@@ -631,17 +700,12 @@ class Pluto:
         Returns:
             float: Pitch angle in degrees.
         """
-        self.send_request_msp(self.create_packet_msp(MSP_ATTITUDE, []))
-        for _ in range(RETRY_COUNT):
-            data = self.receive_packet()
-            j = 0
-            while j < len(data) and data[j] != 108:
-                j += 1
-            if j + 5 < len(data):
-                pitch = self.read16(data[j + 3:j + 5]) / 10
-                print(f"pitch: {pitch} degrees")
-                return pitch
-        return 0.0
+        pitch = self._field(MSP_ATTITUDE, 2)  # deci-degrees
+        if pitch is None:
+            return 0.0
+        pitch = pitch / 10
+        print(f"pitch: {pitch} degrees")
+        return pitch
 
     def get_yaw(self) -> float:
         """
@@ -650,125 +714,52 @@ class Pluto:
         Returns:
             float: Yaw angle in degrees.
         """
-        self.send_request_msp(self.create_packet_msp(MSP_ATTITUDE, []))
-        for _ in range(RETRY_COUNT):
-            data = self.receive_packet()
-            j = 0
-            while j < len(data) and data[j] != 108:
-                j += 1
-            if j + 7 < len(data):
-                yaw = self.read16(data[j + 5:j + 7])
-                print(f"yaw: {yaw} degrees")
-                return float(yaw)
-        return 0.0
+        yaw = self._field(MSP_ATTITUDE, 4)  # heading, degrees
+        if yaw is None:
+            return 0.0
+        print(f"yaw: {yaw} degrees")
+        return float(yaw)
+
+    def _imu(self, index: int) -> int:
+        """RAW_IMU value: 0-2 accelerometer, 3-5 gyroscope, 6-8 magnetometer."""
+        value = self._field(MSP_RAW_IMU, index * 2)
+        return 0 if value is None else value
 
     def get_acc_x(self) -> int:
-        """Get raw Accelerometer X value (unsigned 16-bit)."""
-        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
-        for _ in range(RETRY_COUNT):
-            data = self.receive_packet()
-            j = 0
-            while j < len(data) and data[j] != 102:
-                j += 1
-            if j + 3 < len(data):
-                return self.read16(data[j + 1:j + 3])
-        return 0
+        """Get raw Accelerometer X value (signed 16-bit)."""
+        return self._imu(0)
 
     def get_acc_y(self) -> int:
-        """Get raw Accelerometer Y value (unsigned 16-bit)."""
-        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
-        for _ in range(RETRY_COUNT):
-            data = self.receive_packet()
-            j = 0
-            while j < len(data) and data[j] != 102:
-                j += 1
-            if j + 5 < len(data):
-                return self.read16(data[j + 3:j + 5])
-        return 0
+        """Get raw Accelerometer Y value (signed 16-bit)."""
+        return self._imu(1)
 
     def get_acc_z(self) -> int:
-        """Get raw Accelerometer Z value (unsigned 16-bit)."""
-        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
-        for _ in range(RETRY_COUNT):
-            data = self.receive_packet()
-            j = 0
-            while j < len(data) and data[j] != 102:
-                j += 1
-            if j + 7 < len(data):
-                return self.read16(data[j + 5:j + 7])
-        return 0
+        """Get raw Accelerometer Z value (signed 16-bit)."""
+        return self._imu(2)
 
     def get_gyro_x(self) -> int:
-        """Get raw Gyroscope X value (unsigned 16-bit)."""
-        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
-        for _ in range(RETRY_COUNT):
-            data = self.receive_packet()
-            j = 0
-            while j < len(data) and data[j] != 102:
-                j += 1
-            if j + 9 < len(data):
-                return self.read16(data[j + 7:j + 9])
-        return 0
+        """Get raw Gyroscope X value (signed 16-bit)."""
+        return self._imu(3)
 
     def get_gyro_y(self) -> int:
-        """Get raw Gyroscope Y value (unsigned 16-bit)."""
-        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
-        for _ in range(RETRY_COUNT):
-            data = self.receive_packet()
-            j = 0
-            while j < len(data) and data[j] != 102:
-                j += 1
-            if j + 11 < len(data):
-                return self.read16(data[j + 9:j + 11])
-        return 0
+        """Get raw Gyroscope Y value (signed 16-bit)."""
+        return self._imu(4)
 
     def get_gyro_z(self) -> int:
-        """Get raw Gyroscope Z value (unsigned 16-bit)."""
-        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
-        for _ in range(RETRY_COUNT):
-            data = self.receive_packet()
-            j = 0
-            while j < len(data) and data[j] != 102:
-                j += 1
-            if j + 13 < len(data):
-                return self.read16(data[j + 11:j + 13])
-        return 0
+        """Get raw Gyroscope Z value (signed 16-bit)."""
+        return self._imu(5)
 
     def get_mag_x(self) -> int:
-        """Get raw Magnetometer X value (unsigned 16-bit)."""
-        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
-        for _ in range(RETRY_COUNT):
-            data = self.receive_packet()
-            j = 0
-            while j < len(data) and data[j] != 102:
-                j += 1
-            if j + 15 < len(data):
-                return self.read16(data[j + 13:j + 15])
-        return 0
+        """Get raw Magnetometer X value (signed 16-bit)."""
+        return self._imu(6)
 
     def get_mag_y(self) -> int:
-        """Get raw Magnetometer Y value (unsigned 16-bit)."""
-        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
-        for _ in range(RETRY_COUNT):
-            data = self.receive_packet()
-            j = 0
-            while j < len(data) and data[j] != 102:
-                j += 1
-            if j + 17 < len(data):
-                return self.read16(data[j + 15:j + 17])
-        return 0
+        """Get raw Magnetometer Y value (signed 16-bit)."""
+        return self._imu(7)
 
     def get_mag_z(self) -> int:
-        """Get raw Magnetometer Z value (unsigned 16-bit)."""
-        self.send_request_msp(self.create_packet_msp(MSP_RAW_IMU, []))
-        for _ in range(RETRY_COUNT):
-            data = self.receive_packet()
-            j = 0
-            while j < len(data) and data[j] != 102:
-                j += 1
-            if j + 19 < len(data):
-                return self.read16(data[j + 17:j + 19])
-        return 0
+        """Get raw Magnetometer Z value (signed 16-bit)."""
+        return self._imu(8)
 
     def calibrate_acceleration(self) -> None:
         """
@@ -793,149 +784,189 @@ class Pluto:
         Get the current battery voltage.
 
         Returns:
-            float: Battery voltage in Volts.
+            float: Battery voltage in Volts (the BMS's compensated voltage on Protocol V1
+            boards), 0.0 if no data.
         """
-        self.send_request_msp(self.create_packet_msp(MSP_ANALOG, []))
-        for _ in range(RETRY_COUNT):
-            data = self.receive_packet()
-            j = 0
-            while j < len(data) and data[j] != 110:
-                j += 1
-            if j + 1 < len(data):
-                return self.read8(data[j + 1]) / 10.0
-        return 0.0
+        telemetry = self.get_analog_telemetry()
+        if not telemetry:
+            return 0.0
+        if self.MSP_Protocol_Version == 1:
+            return telemetry['vBatComp']
+        return telemetry['bytevbat']
 
     def get_battery_percentage(self) -> float:
         """
-        Get the current battery percentage (estimated).
+        Get the battery percentage.
+
+        On Protocol V1 boards this is the drone's own state of charge from its BMS,
+        returned as sent. Older boards do not send one, so it is estimated from the
+        voltage (3.7 V = 0 %, 4.2 V = 100 %).
 
         Returns:
-            float: Battery percentage (0.0 to 100.0), clamped.
+            float: 0.0 to 100.0 (0.0 if no data).
         """
-        self.send_request_msp(self.create_packet_msp(MSP_ANALOG, []))
-        for _ in range(RETRY_COUNT):
-            data = self.receive_packet()
-            j = 0
-            while j < len(data) and data[j] != 110:
-                j += 1
-            if j + 1 < len(data):
-                voltage = self.read8(data[j + 1]) / 10.0
-                percentage = ((voltage - 3.7) / (4.2 - 3.7)) * 100
-                return max(0.0, min(100.0, percentage))
-        return 0.0
-            
-    # Removed enable_raw_log function as per request for simplicity
+        telemetry = self.get_analog_telemetry()
+        if not telemetry:
+            return 0.0
+        if self.MSP_Protocol_Version == 1:
+            return float(telemetry['soc_Fused'])
+        voltage = telemetry['bytevbat']
+        percentage = ((voltage - BATTERY_IDLE_VOLTAGE)
+                      / (BATTERY_MAX_VOLTAGE - BATTERY_IDLE_VOLTAGE)) * 100
+        return max(0.0, min(100.0, percentage))
 
-    def receive_packet(self):
-        try:
-            # Read from socket
-            data = self.client.recv(4096)
-            if not data:
-                return b''
-            
-            # Check for debug messages ($MD) if dev mode is on
-            # We scan the received chunk for the debug header or raw text
-            if self.dev_mode_enabled:
-                self.check_and_print_debug_msg(data)
-                
-            return data
-        except socket.timeout:
-            return b''
-        except Exception as e:
-            # Only print error if connected to avoid spam on disconnect
-            if self.connected:
-                print(f"Receive error: {e}")
-            return b''
+    # ── Receiving ───────────────────────────────────────────────────────────
 
-    def check_and_print_debug_msg(self, data: bytes) -> None:
+    def _read_function(self):
         """
-        Internal method to parse and print debug messages/strings from the drone.
-        Only active when dev_mode_enabled is True.
-        
-        Handles:
-        1. MSP Debug Packets ($D...)
-        2. Raw Serial Text (newline terminated)
+        Background thread that drains the socket and parses everything the drone sends.
+
+        Without it the replies to the writer's requests pile up unread and the getters
+        would read data that is seconds old.
         """
-        if not self.dev_mode_enabled or not data:
-            return
-        self.debug_buffer.extend(data)
-        
-        # Limit buffer to prevent infinite growth
-        if len(self.debug_buffer) > 4096:
-             self.debug_buffer = self.debug_buffer[-2048:]
-            
-        while True:
-            # Check for potential MSP Debug Header ($D)
-            idx_msp = self.debug_buffer.find(b'$D')
-            
-            # Check for potential Newlines (Raw Text)
-            idx_newline = -1
+        silent_seconds = 0
+        while self.connected and not self._stop_event.is_set():
+            client = self.client
             try:
-                # Find first newline
-                for i in range(len(self.debug_buffer)):
-                    if self.debug_buffer[i] == 10: # \n
-                        idx_newline = i
-                        break
-            except Exception:
-                pass
-
-            # Decision Logic: Process whichever comes first, or process text if no MSP
-            
-            # CASE 1: Found MSP Header
-            if idx_msp != -1:
-                # If newline comes BEFORE MSP header, process text first (it's garbage/raw)
-                if idx_newline != -1 and idx_newline < idx_msp:
-                    line_data = self.debug_buffer[:idx_newline+1]
-                    try:
-                        line = line_data.decode('utf-8', errors='ignore').strip()
-                        if line and len(line) > 1 and not line.startswith('$'):
-                            print(f"[SERIAL] {line}")
-                    except Exception: pass
-                    self.debug_buffer = self.debug_buffer[idx_newline+1:]
-                    continue
-
-                # Process MSP Packet
-                if idx_msp + 3 <= len(self.debug_buffer):
-                    payload_size = self.debug_buffer[idx_msp+2]
-                    total_packet_size = 4 + payload_size
-                    
-                    if idx_msp + total_packet_size <= len(self.debug_buffer):
-                         # Extract payload
-                        payload = self.debug_buffer[idx_msp+3 : idx_msp+3+payload_size]
-                        try:
-                            debug_msg = payload.decode('utf-8', errors='ignore').strip()
-                            if debug_msg and not debug_msg.startswith('~'):
-                                timestamp = time.strftime("%H:%M:%S")
-                                print(f"[DEBUG {timestamp}] {debug_msg}")
-                        except Exception:
-                            pass
-                        
-                        # Remove packet
-                        self.debug_buffer = self.debug_buffer[idx_msp + total_packet_size:]
-                        continue
-                    else:
-                        # Incomplete MSP packet, wait for more data
-                        break
-                else:
-                    # Incomplete header, wait for more data
-                    break
-            
-            # CASE 2: No MSP Header, but found Newline (Raw Text)
-            elif idx_newline != -1:
-                line_data = self.debug_buffer[:idx_newline+1]
-                try:
-                    line = line_data.decode('utf-8', errors='ignore').strip()
-                    # Filter out purely binary-looking lines or extremely short ones unless clearly text
-                    if line and len(line) > 1:
-                        # Ensure it's not a fragment of another MSP command
-                        if not line.startswith('$M'): 
-                             print(f"[SERIAL] {line}")
-                except Exception: pass
-                self.debug_buffer = self.debug_buffer[idx_newline+1:]
+                data = client.recv(4096)
+            except socket.timeout:
+                silent_seconds += 1
+                if silent_seconds == 3:
+                    print("Warning: no data from the drone for 3 seconds (Wi-Fi link down?)")
                 continue
-                
-            # No relevant data found
-            break
+            except OSError as e:
+                if client is self.client:  # not a socket left over from a previous link
+                    self._link_lost(e)
+                continue
+            if not data:
+                if client is self.client:
+                    self._link_lost("the drone closed the connection")
+                continue
+            silent_seconds = 0
+            try:
+                self._parse_rx(data)
+            except Exception as e:  # a parser bug must not stop telemetry for good
+                print(f"Telemetry parse error: {e!r}")
+                self._rx_buf.clear()
+
+    def _parse_rx(self, data: bytes) -> None:
+        """Split received bytes into MSP replies ($M>), debug messages ($D) and serial text."""
+        buf = self._rx_buf
+        buf += data
+        n = len(buf)
+        i = 0
+        while i < n:
+            start = buf.find(b'$', i)
+            if start < 0:
+                self._serial_text(buf[i:])
+                i = n
+                break
+            if start > i:
+                self._serial_text(buf[i:start])
+            if n - start < 2:
+                i = start  # wait for the byte after '$'
+                break
+            kind = buf[start + 1]
+            if kind == 0x4D:  # 'M': $M> size cmd payload checksum
+                if n - start < 5:
+                    i = start
+                    break
+                direction, size, cmd = buf[start + 2], buf[start + 3], buf[start + 4]
+                if direction not in (0x3E, 0x21):  # '>' reply, '!' error
+                    self._serial_text(buf[start:start + 1])
+                    i = start + 1
+                    continue
+                end = start + 6 + size
+                if n < end:
+                    i = start
+                    break
+                payload = bytes(buf[start + 5:end - 1])
+                checksum = size ^ cmd
+                for b in payload:
+                    checksum ^= b
+                if checksum != buf[end - 1]:
+                    i = start + 1  # corrupt frame: resync on the next '$'
+                    continue
+                if direction == 0x3E:
+                    self._store_frame(cmd, payload)
+                elif cmd not in self._rejected_cmds:
+                    self._rejected_cmds.add(cmd)
+                    print(f"Drone rejected MSP command {cmd} "
+                          "(not supported by this firmware, or not allowed right now)")
+                i = end
+            elif kind == 0x44:  # 'D': $D size message checksum, from debugPrint()
+                if n - start < 3:
+                    i = start
+                    break
+                size = buf[start + 2]
+                end = start + 4 + size
+                if n < end:
+                    i = start
+                    break
+                self._debug_message(bytes(buf[start + 3:end - 1]))
+                i = end
+            else:
+                self._serial_text(buf[start:start + 1])
+                i = start + 1
+        del buf[:i]
+
+    def _store_frame(self, cmd: int, payload: bytes) -> None:
+        with self._frames_cv:
+            self._frames[cmd] = (payload, time.monotonic())
+            self._frames_cv.notify_all()
+
+    def _get_frame(self, cmd: int, min_size: int, timeout: float = 1.0) -> Optional[bytes]:
+        """
+        Payload of the latest reply to `cmd`, if it is at most FRAME_MAX_AGE seconds old.
+
+        Otherwise waits up to `timeout` seconds for a new one. Returns None when not
+        connected, or when no reply of at least `min_size` bytes arrives in time.
+        """
+        deadline = time.monotonic() + timeout
+        with self._frames_cv:
+            while True:
+                if not self.connected:  # never hand out data from a link that is gone
+                    self._warn_not_connected()
+                    return None
+                now = time.monotonic()
+                frame = self._frames.get(cmd)
+                if frame and now - frame[1] <= FRAME_MAX_AGE and len(frame[0]) >= min_size:
+                    return frame[0]
+                if now >= deadline:
+                    return None
+                self._frames_cv.wait(deadline - now)
+
+    def _field(self, cmd: int, offset: int, size: int = 2, signed: bool = True) -> Optional[int]:
+        """Little-endian integer at payload[offset:offset + size] of the latest `cmd` reply."""
+        payload = self._get_frame(cmd, offset + size)
+        if payload is None:
+            return None
+        return int.from_bytes(payload[offset:offset + size], 'little', signed=signed)
+
+    def _serial_text(self, chunk) -> None:
+        """Raw text from the drone's serial port: printed line by line in dev mode."""
+        if not self.dev_mode_enabled:
+            self._rx_text.clear()
+            return
+        self._rx_text += chunk
+        while True:
+            newline = self._rx_text.find(b'\n')
+            if newline < 0:
+                break
+            line = self._rx_text[:newline].decode('utf-8', errors='ignore').strip()
+            del self._rx_text[:newline + 1]
+            if len(line) > 1 and line.isprintable():
+                print(f"[SERIAL] {line}")
+        if len(self._rx_text) > 1024:  # no newline in sight: not text
+            self._rx_text.clear()
+
+    def _debug_message(self, payload: bytes) -> None:
+        """A debugPrint() message from the drone: printed in dev mode."""
+        if not self.dev_mode_enabled:
+            return
+        message = payload.decode('utf-8', errors='ignore').strip()
+        if message and not message.startswith('~'):
+            print(f"[DEBUG {time.strftime('%H:%M:%S')}] {message}")
 
     def read16(self, arr):
         """Signed little-endian 16-bit value from the first two bytes of arr."""
@@ -949,59 +980,50 @@ class Pluto:
     
     def get_analog_telemetry(self):
         """
-        Get comprehensive analog telemetry data including battery info
-        Supports both Protocol Version 1 and other versions
-        Returns a dictionary with all available telemetry
+        Get the latest MSP_ANALOG (battery) telemetry.
+
+        Protocol V1 boards send the BMS's own values, which are returned as sent:
+        current in mA, capacity in mAh, state of charge in %, warning mode as a code.
+        Only vBatComp is scaled, from mV to volts.
+
+        Returns:
+            dict or None: None if no reply arrived. Keys depend on MSP_Protocol_Version.
         """
-        data = self.receive_packet()
-        i = 0
-        
-        # Find MSP_ANALOG response (command 110)
-        while i < len(data) and data[i] != MSP_ANALOG:
-            i += 1
-        
-        if i >= len(data):
-            return None
-        
-        telemetry = {}
-        
         if self.MSP_Protocol_Version == 1:
-            # Protocol Version 1: Enhanced telemetry
-            if i + 11 < len(data):
-                self.vBatComp = self.read16(data[i + 1:i + 3])
-                self.mAmpRaw = self.read16(data[i + 3:i + 5])
-                self.mAhDrawn = self.read16(data[i + 5:i + 7])
-                self.mAhRemain = self.read16(data[i + 7:i + 9])
-                self.soc_Fused = self.read8(data[i + 9])
-                self.auto_LandMode = self.read8(data[i + 10])
-                
-                telemetry = {
-                    'vBatComp': self.vBatComp / 1000.0,  # Convert to volts (divide by 1000)
-                    'mAmpRaw': self.mAmpRaw,
-                    'mAhDrawn': self.mAhDrawn,
-                    'mAhRemain': self.mAhRemain,
-                    'soc_Fused': self.soc_Fused,
-                    'auto_LandMode': self.auto_LandMode,
-                    'protocol_version': 1
-                }
-        else:
-            # Other versions: Basic telemetry
-            if i + 7 < len(data):
-                self.bytevbat = self.read8(data[i + 1])
-                self.pMeterSum = self.read16(data[i + 2:i + 4])
-                self.rssi = self.read16(data[i + 4:i + 6])
-                self.amperage = self.read16(data[i + 6:i + 8])
-                
-                telemetry = {
-                    'bytevbat': self.bytevbat / 10.0,  # Convert to volts
-                    'pMeterSum': self.pMeterSum,
-                    'rssi': self.rssi,
-                    'amperage': self.amperage,
-                    'protocol_version': self.MSP_Protocol_Version
-                }
-        
-        return telemetry
-    
+            # u16 vBatComp (mV), mAmpRaw (mA), mAhDrawn, mAhRemain (mAh); u8 SoC (%), warning mode
+            data = self._get_frame(MSP_ANALOG, 10)
+            if data is None:
+                return None
+            self.vBatComp, self.mAmpRaw, self.mAhDrawn, self.mAhRemain = (
+                int.from_bytes(data[k:k + 2], 'little') for k in (0, 2, 4, 6))
+            self.soc_Fused = data[8]
+            self.auto_LandMode = data[9]
+            return {
+                'vBatComp': self.vBatComp / 1000.0,  # mV -> V
+                'mAmpRaw': self.mAmpRaw,
+                'mAhDrawn': self.mAhDrawn,
+                'mAhRemain': self.mAhRemain,
+                'soc_Fused': self.soc_Fused,
+                'auto_LandMode': self.auto_LandMode,
+                'protocol_version': 1
+            }
+
+        # Older boards: u8 vbat (0.1 V), u16 power meter sum, u16 RSSI, s16 amperage
+        data = self._get_frame(MSP_ANALOG, 7)
+        if data is None:
+            return None
+        self.bytevbat = data[0]
+        self.pMeterSum = int.from_bytes(data[1:3], 'little')
+        self.rssi = int.from_bytes(data[3:5], 'little')
+        self.amperage = self.read16(data[5:7])
+        return {
+            'bytevbat': self.bytevbat / 10.0,  # Convert to volts
+            'pMeterSum': self.pMeterSum,
+            'rssi': self.rssi,
+            'amperage': self.amperage,
+            'protocol_version': self.MSP_Protocol_Version
+        }
+
     def get_battery_voltage_compensated(self) -> float:
         """Get compensated battery voltage (Volts)."""
         self.get_analog_telemetry()
