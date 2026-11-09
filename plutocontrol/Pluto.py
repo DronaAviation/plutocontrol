@@ -442,16 +442,18 @@ class Pluto:
     def trim(self, roll: int, pitch: int) -> None:
         """
         Set ACC Trim values.
-        
+
+        The drone applies them at once and keeps them until it reboots. To keep them
+        after a reboot, call send_request_msp_eeprom_write() while disarmed (the drone
+        refuses EEPROM writes while armed).
+
         Args:
-            roll (int): Roll trim value.
-            pitch (int): Pitch trim value.
+            roll (int): Roll trim value (-1000 to 1000).
+            pitch (int): Pitch trim value (-1000 to 1000).
         """
         roll = max(min(roll, TRIM_MAX), TRIM_MIN)
         pitch = max(min(pitch, TRIM_MAX), TRIM_MIN)
-        
-        # Pass as list of 16-bit integers [roll, pitch]
-        self.send_request_msp(self.create_packet_msp(MSP_ACC_TRIM, [roll, pitch]))
+        self.send_request_msp_set_acc_trim(roll, pitch)
             
     def send_request_msp(self, data):
        if self.connected:
@@ -514,7 +516,9 @@ class Pluto:
             self.send_request_msp(self.create_packet_msp(requests[i], []))
 
     def send_request_msp_set_acc_trim(self, trim_roll, trim_pitch):
-        self.send_request_msp(self.create_packet_msp(MSP_ACC_TRIM, [trim_roll, trim_pitch]))
+        # MSP_SET_ACC_TRIM (239), not MSP_ACC_TRIM (240, which only reads the trim).
+        # The firmware reads pitch first, then roll.
+        self.send_request_msp(self.create_packet_msp(MSP_SET_ACC_TRIM, [trim_pitch, trim_roll]))
 
     def send_request_msp_acc_trim(self):
         if self.connected:
@@ -934,10 +938,8 @@ class Pluto:
             break
 
     def read16(self, arr):
-        if (arr[1] & 0x80) == 0:
-            return (arr[1] << 8) + (arr[0] & 0xff)
-        else:
-            return (-65535 + (arr[1] << 8) + (arr[0] & 0xff))
+        """Signed little-endian 16-bit value from the first two bytes of arr."""
+        return int.from_bytes(bytes(arr[:2]), 'little', signed=True)
     
     def read8(self, value):
         """Read single byte value"""
