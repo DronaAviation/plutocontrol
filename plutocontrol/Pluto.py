@@ -73,7 +73,9 @@ class Pluto:
         self.TCP_PORT = port
         
         # MSP Protocol Version (Pluto drones use Protocol V1)
-        self.MSP_Protocol_Version = 1  # Default to V1 for Pluto drones
+        # 1 = MagisV2 battery layout (BMS values), 0 = older Magis 7-byte layout.
+        # Set automatically from every MSP_ANALOG reply (see get_analog_telemetry).
+        self.MSP_Protocol_Version = 1
         
         # Enhanced battery telemetry (Protocol Version 1)
         self.vBatComp = 0      # Battery voltage compensated
@@ -1024,14 +1026,20 @@ class Pluto:
         current in mA, capacity in mAh, state of charge in %, warning mode as a code.
         Only vBatComp is scaled, from mV to volts.
 
+        The reply's size tells which layout the board sends, and MSP_Protocol_Version is
+        set from it: 1 for MagisV2 (10 bytes, BMS values), 0 for older Magis firmware
+        (7 bytes, MultiWii layout).
+
         Returns:
             dict or None: None if no reply arrived. Keys depend on MSP_Protocol_Version.
         """
+        data = self._get_frame(MSP_ANALOG, 7)
+        if data is None:
+            return None
+        self.MSP_Protocol_Version = 1 if len(data) >= 10 else 0
+
         if self.MSP_Protocol_Version == 1:
             # u16 vBatComp (mV), mAmpRaw (mA), mAhDrawn, mAhRemain (mAh); u8 SoC (%), warning mode
-            data = self._get_frame(MSP_ANALOG, 10)
-            if data is None:
-                return None
             self.vBatComp, self.mAmpRaw, self.mAhDrawn, self.mAhRemain = (
                 int.from_bytes(data[k:k + 2], 'little') for k in (0, 2, 4, 6))
             self.soc_Fused = data[8]
@@ -1047,9 +1055,6 @@ class Pluto:
             }
 
         # Older boards: u8 vbat (0.1 V), u16 power meter sum, u16 RSSI, s16 amperage
-        data = self._get_frame(MSP_ANALOG, 7)
-        if data is None:
-            return None
         self.bytevbat = data[0]
         self.pMeterSum = int.from_bytes(data[1:3], 'little')
         self.rssi = int.from_bytes(data[3:5], 'little')
@@ -1211,6 +1216,7 @@ class Pluto:
         Returns:
             dict: Detailed status including icon, warnings, and flags.
         """
+        self.get_analog_telemetry()  # sets MSP_Protocol_Version from the board's reply
         if self.MSP_Protocol_Version != 1:
             return {
                 'error': 'Enhanced telemetry only available in Protocol V1',
