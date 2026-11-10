@@ -8,6 +8,8 @@ plutocontrol is a Python library for controlling Pluto drones. This library prov
 pip install plutocontrol
 ```
 
+Needs Python 3.8 or newer.
+
 ## Usage
 
 After installing the package, you can import and use the `Pluto` class in your Python scripts.
@@ -92,12 +94,17 @@ pluto.disconnect()
 Commands to connect/ disconnect to the drone server.
 
 ```python
-#Connects from the drone server.
-pluto.connect()
+#Connects to the drone server. Returns True if connected, False if it failed.
+if not pluto.connect():
+    raise SystemExit("Could not connect to the drone")
 
 #Disconnects from the drone server.
 pluto.disconnect()
 ```
+
+If the drone has been answering and then goes silent for 3 seconds (for example out of
+Wi-Fi range), the library treats the link as lost: `pluto.connected` becomes `False`, it
+prints why, and `pluto.connect()` reconnects.
 
 #### `Camera module`
 Sets the IP and port for the camera connection. should be initialized before pluto.connect().
@@ -116,35 +123,37 @@ pluto.arm()
 pluto.disarm()
 ```
 
-#### `Pitch Commands`
+#### `Movement Commands`
+
+Each command holds its stick at `1500 +/- strength` until `reset()` or another command
+changes it. `strength` is optional: an integer from 0 to 500. On MagisV2 firmware the
+default is 200 in every direction, so opposite moves are equally strong. Drones with older
+Magis firmware keep their original defaults (shown in brackets below).
 
 ```python
-#Sets the drone to move forward.
+#Pitch: move forward / backward (pitch 1700 / 1300) [older Magis: 1600 / 1300].
 pluto.forward()
-
-#Sets the drone to move backward.
 pluto.backward()
-```
 
-#### `Roll Commands`
-
-```python
-#Sets the drone to move left (roll).
+#Roll: move left / right (roll 1300 / 1700) [older Magis: 1200 / 1600].
 pluto.left()
-
-#Sets the drone to move right (roll).
 pluto.right()
-```
 
-#### `Yaw Commands`
-
-```python
-#Sets the drone to yaw right.
+#Yaw: rotate left / right (yaw 1300 / 1700) [older Magis: 1300 / 1600].
+pluto.left_yaw()
 pluto.right_yaw()
 
-#Sets the drone to yaw left.
-pluto.left_yaw()
+#Gentler or stronger moves, e.g. in a small room or outdoors.
+pluto.forward(100)   # pitch 1600
+pluto.left(300)      # roll 1200
+
+#Back to centre (roll, pitch, yaw and throttle 1500).
+pluto.reset()
 ```
+
+On MagisV2 firmware the library flies in headfree mode (AUX1 = 1500): forward, backward,
+left and right stay relative to the drone's starting heading, not to where its nose points
+after a yaw.
 
 #### `Throttle Commands`
 
@@ -161,12 +170,15 @@ pluto.decrease_height()
 #### `Takeoff and Land`
 
 ```Python
-#Arms the drone and prepares it for takeoff.
+#Arms the drone and takes off. On MagisV2 it climbs to about 120 cm and holds that height.
 pluto.take_off()
 
 #Commands the drone to land.
 pluto.land()
 ```
+
+On MagisV2 firmware `take_off()` centres the sticks (throttle 1500): the firmware only
+takes off with the throttle centred. Older Magis firmware gets throttle 1800, as before.
 
 #### `Developer Mode`
 Toggle Developer Mode
@@ -180,10 +192,29 @@ pluto.devOff()
 ```
 
 #### `motor_speed(motor_index, speed)`
-Sets the speed of a specific motor (motor index from 0 to 3).
+Motor test: spins one motor while the drone is **disarmed**. `motor_index` is an integer
+from 0 to 3 and `speed` an integer from 1000 to 2000. Anything else is refused with a
+message and nothing is sent.
+
+The motor keeps spinning until `motor_speed(index, 1000)`, `arm()`, `take_off()` or
+`disconnect()`. Keep hands clear. On MagisV2 firmware it is refused while armed: the drone
+would keep the value and spin the motor as soon as it disarms.
 
 ```Python
-pluto.motor_speed(0, 1500)
+pluto.motor_speed(0, 1500)   # spin motor 0
+pluto.motor_speed(0, 1000)   # stop it
+```
+
+#### `Telemetry`
+
+The getters below return the latest value from the drone, or `None` when there is no
+current data (not connected, or nothing from the drone for about a second). Check for
+`None` before using a value:
+
+```python
+height = pluto.get_height()
+if height is not None and height > 100:
+    pluto.decrease_height()
 ```
 
 #### `Get MSP_ALTITUDE Values`
@@ -196,7 +227,7 @@ height = pluto.get_height()
 vario = pluto.get_vario()
 ```
 
-#### `Get MSP_ALTITUDE Values`
+#### `Get MSP_ATTITUDE Values`
 
 ```python
 #Returns the roll value from the drone.
@@ -255,6 +286,10 @@ mag_z = pluto.get_mag_z()
 
 #### `Calibration Commands`
 
+Place the drone on a flat, level surface and keep it still for a few seconds while it
+calibrates. The drone ignores calibration while armed (without an error), so on MagisV2
+firmware these are refused while armed: call `disarm()` first.
+
 ```python
 #Calibrates the accelerometer.
 pluto.calibrate_acceleration()
@@ -263,26 +298,100 @@ pluto.calibrate_acceleration()
 pluto.calibrate_magnetometer()
 ```
 
+#### `Flight Status` (MagisV2)
+
+The drone's own status, as the Pluto app shows it. Use it to find out why `arm()` or
+`take_off()` did nothing. Returns `None` if there is no reply.
+
+```python
+status = pluto.get_flight_status()
+# 'ACCEL_GYRO_CALIBRATION', 'MAG_CALIBRATION', 'CRASH', 'LOW_BATTERY',
+# 'LOW_BATTERY_IN_FLIGHT', 'SIGNAL_LOSS', 'NOT_OK_TO_ARM', 'OK_TO_ARM' or 'ARMED'
+
+#True / False, or None when the drone reports a more important state
+#(crash, low battery, signal loss) that hides whether it is armed.
+armed = pluto.is_armed()
+```
+
+The drone reports one state at a time, the most important first: calibrating, crash, low
+battery, signal loss, not OK to arm, OK to arm, armed.
+
+#### `Height Ceiling` (MagisV2)
+
+A safety ceiling for indoor flying: in altitude hold the drone does not climb above it.
+The drone keeps it until it reboots.
+
+```python
+pluto.set_max_height(100)     # stay below 1 m
+ceiling = pluto.get_max_height()   # cm, -1 if there is none, None if no reply
+pluto.set_max_height(None)    # remove the ceiling
+```
+
+#### `set_height(cm)`: hold a height
+
+Sets the height the drone holds, in cm (0-10000). The drone climbs or descends to it
+smoothly. Call it after take-off (take-off sets its own 120 cm target) and keep the
+throttle centred: `increase_height()` / `decrease_height()` take over from the target.
+
+**Needs firmware with MSP 227** (the ws28py build today; it is being added to the MagisV2
+CG tilt branch). Other firmware refuses it and the library prints
+`set_height: needs firmware with MSP 227`; nothing else is affected.
+
+```python
+pluto.take_off()
+time.sleep(4)
+pluto.set_height(80)    # hold 80 cm
+```
+
+#### `RGB LED strip` (WS2812B)
+
+Controls a WS2812B LED strip on the drone. **Needs firmware with MSP 225/226** (the ws28py
+build today); other firmware refuses it with a printed message. Call `led_init()` before
+arming.
+
+```python
+pluto.led_init(8)                   # take the strip: 8 LEDs (1-64)
+pluto.set_led(0, 255, 0, 0)         # LED 0 red (r, g, b 0-255)
+pluto.set_led(1, 0, 0, 255, 50)     # LED 1 blue at 50 % brightness
+pluto.set_all_leds(0, 255, 0)       # every LED green
+pluto.wait_leds()                   # wait until everything queued has been sent
+pluto.led_release()                 # turn it off and give it back to the drone
+```
+
+LED packets take the place of a telemetry request in the library's update cycle, so they
+never add to the drone's command load. Calls return at once.
+
 #### `Get MSP_Analog Values`
 
 ```python
-#Returns the battery value in volts from the drone.
+#Returns the battery value in volts from the drone (None if no data).
 battery = pluto.get_battery()
 
-#Returns the battery percentage from the drone.
+#Returns the battery percentage from the drone (None if no data).
 battery_percentage = pluto.get_battery_percentage()
 ```
 
 ## Enhanced Battery Telemetry (Mobile App Features)
 
-The package now supports enhanced battery telemetry matching the mobile app functionality, with support for multiple MSP protocol versions.
+The package supports enhanced battery telemetry matching the mobile app, on MagisV2 and on
+older Magis firmware.
+
+**MagisV2 sends its battery values ready to use.** State of charge, mAh drawn and
+remaining, and the battery warning come from the drone's own battery monitor and are
+returned exactly as sent; only the voltage is converted from mV to V. The battery capacity
+the drone uses for them is stored in the drone, not in the library.
+
+Every battery method returns `None` when there is no current data (not connected, or
+nothing from the drone for about a second), and for values the connected firmware does not
+send. Nothing from an earlier connection is ever returned as current.
 
 ### Protocol Version Detection
 
-The drone's MSP protocol version is automatically detected:
+The firmware is detected automatically from the battery reply (10 bytes on MagisV2, 7 on
+older Magis):
 
 ```python
-# Check protocol version
+# 1 = MagisV2 battery layout, 0 = older Magis
 print(f"Protocol Version: {pluto.MSP_Protocol_Version}")
 ```
 
@@ -291,17 +400,18 @@ print(f"Protocol Version: {pluto.MSP_Protocol_Version}")
 Get all battery information in one call:
 
 ```python
-#Get comprehensive battery info (all parameters)
+#Get comprehensive battery info (all parameters), None if no data
 battery_info = pluto.get_battery_info()
 
-# Protocol V1 returns:
+# MagisV2 returns:
 # {
-#     'voltage': '11.25V',
-#     'current': '1250mA',
-#     'capacity_drawn': '450mAh',
-#     'capacity_remaining': '1350mAh',
-#     'state_of_charge': '75%',
+#     'voltage': '4.10V',
+#     'current': '350mA',
+#     'capacity_drawn': '51mAh',
+#     'capacity_remaining': '549mAh',
+#     'state_of_charge': '91%',
 #     'auto_land_mode': 0,
+#     'battery_warning': 'OK',
 #     'protocol': 'V1 (Enhanced)'
 # }
 ```
@@ -310,25 +420,35 @@ battery_info = pluto.get_battery_info()
 Convenient methods to check battery status without parsing raw values.
 
 ```python
-# Get status string ('FULL', 'TWO_BAR', 'ONE_BAR', 'EMPTY')
+# Get status string ('FULL', 'TWO_BAR', 'ONE_BAR', 'EMPTY'), None if no data
 status = pluto.get_battery_level_status()
+
+# The drone's own battery warning: 'OK', 'WARNING' or 'CRITICAL'
+warning = pluto.get_battery_warning()
 
 # Check for critical battery (< 20%)
 if pluto.is_battery_critical():
     print("LAND NOW!")
 
-# Check if auto-landing is triggered
+# True when the drone warns about its battery (WARNING or CRITICAL): land now
 if pluto.should_auto_land():
-    print("Drone is auto-landing due to low battery")
+    print("Battery low: land now")
 
-# Get a full summary dict (for UI/Display)
+# Get a full summary dict (for UI/Display), built from one reading; None if no data
 summary = pluto.get_battery_status_summary()
-print(f"Icon: {summary['icon']} | Voltage: {summary['voltage']}")
+if summary is not None:
+    print(f"Icon: {summary['icon']} | Voltage: {summary['voltage']}")
 ```
+
+The CG tilt firmware reports CRITICAL as WARNING while the drone is armed: it is then
+landing by itself and the app only warns. No reply tells "auto-landing" apart, so
+`should_auto_land()` means "the drone warns about its battery". `get_auto_land_status_text()`
+still works and now returns the same as `get_battery_warning()` (it used to say `NORMAL`,
+`LOW_BATTERY_WARNING` or `AUTO_LANDING`).
 
 ### Individual Telemetry Parameters
 
-#### Enhanced Telemetry on Primus X2 / V5 boards
+#### MagisV2 (Primus X2 / V5 boards)
 
 ```python
 #Get compensated battery voltage in volts
@@ -346,11 +466,11 @@ capacity_remaining = pluto.get_capacity_remaining_mAh()
 #Get state of charge (0-100%)
 soc = pluto.get_state_of_charge()
 
-#Get auto-land mode status
-auto_land = pluto.get_auto_land_status()
+#Get the battery warning code: 0 OK, 1 WARNING, 2 CRITICAL
+code = pluto.get_auto_land_status()
 ```
 
-#### Basic Telemetry on Pluto  / V4 boards
+#### Older Magis (Pluto / V4 boards)
 
 ```python
 #Get battery voltage
@@ -368,20 +488,19 @@ power_sum = pluto.get_power_meter_sum()
 
 ### Telemetry Data Structure
 
-**Protocol Version 1:**
-- `vBatComp`: Battery voltage compensated (in centiv olts, divide by 100 for volts)
+**MagisV2 (`MSP_Protocol_Version` 1):**
+- `vBatComp`: Battery voltage, compensated (sent in mV, returned in volts)
 - `mAmpRaw`: Current draw in milliamps
 - `mAhDrawn`: Capacity consumed in milliamp-hours
 - `mAhRemain`: Remaining capacity in milliamp-hours
 - `soc_Fused`: State of charge percentage (0-100)
-- `auto_LandMode`: Auto-land mode status (0=off, 1=on)
+- `auto_LandMode`: Battery warning code (0 OK, 1 WARNING, 2 CRITICAL)
 
-**Other Versions:**
+**Older Magis (`MSP_Protocol_Version` 0):**
 - `bytevbat`: Battery voltage in decivolts (divide by 10 for volts)
 - `pMeterSum`: Power meter sum
 - `rssi`: Signal strength indicator
 - `amperage`: Current draw in milliamps
-
 
 ## Wifi Configuration (Telnet / AT Commands)
 
@@ -482,9 +601,12 @@ my_pluto.disconnect()
 ### Project 2: Keyboard Controller
 Control your drone using your computer keyboard!
 
+The `keyboard` package needs administrator rights on Linux (run with `sudo`) and the
+Accessibility permission for your terminal on macOS. On Windows it works as is.
+
 ```python
 from plutocontrol import Pluto
-import threading
+import time
 import keyboard  # pip install keyboard
 
 pluto = Pluto()
@@ -504,7 +626,8 @@ def control_loop():
             # Reset RC to neutral if keys released
             pluto.rcPitch = 1500
             pluto.rcRoll = 1500
-            
+        time.sleep(0.05)  # check the keys 20 times a second, not millions
+
 control_loop()
 pluto.disarm()
 pluto.disconnect()

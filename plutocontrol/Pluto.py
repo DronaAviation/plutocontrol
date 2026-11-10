@@ -2,21 +2,34 @@ import socket
 from collections import deque
 from threading import Thread, Lock, Event, Condition, current_thread
 import time
-from typing import Optional, List, Dict, Union, Any
+from typing import Optional, List, Dict, Any
 
 TRIM_MAX = 1000
 TRIM_MIN = -1000
 MSP_HEADER_IN = "244d3c"
 
-# Battery Constants (1S LiPo)
+# RC sticks
+RC_MIN = 1000
+RC_CENTER = 1500
+RC_MAX = 2000
+MOVE_STRENGTH_DEFAULT = 200  # MagisV2: offset from centre for forward()/left()/left_yaw()/..., same in every direction
+MOVE_STRENGTH_MAX = 500      # 1500 +/- 500 is the full stick range
+# Older Magis firmware keeps the original (uneven) default offsets
+LEGACY_MOVE_OFFSET = {'forward': 100, 'backward': 200, 'left': 300, 'right': 100,
+                      'left_yaw': 200, 'right_yaw': 100}
+ARM_AUX_MIN = 1300           # AUX4 at or above this arms (MagisV2 ARM range 1300-2100)
+LINK_TIMEOUT = 3.0           # seconds without any data from the drone: the link is lost
+
+# Battery Constants (1S LiPo): only for the voltage estimate on older Magis boards.
+# MagisV2 sends its own state of charge and mAh, computed with the capacity stored in
+# the drone, so the library does no battery maths for it.
 BATTERY_MAX_VOLTAGE = 4.2  # Fully charged
 BATTERY_IDLE_VOLTAGE = 3.7  # Nominal/idle
-BATTERY_CRITICAL_VOLTAGE = 3.0  # Critical low
-BATTERY_DEFAULT_CAPACITY_MAH = 600  # Default battery capacity
+# MagisV2 battery warning code, the last byte of MSP_ANALOG
+BATTERY_WARNING_NAMES = {0: 'OK', 1: 'WARNING', 2: 'CRITICAL'}
 
 # MSP Protocol Commands
 
-MSP_FC_VERSION = 3
 MSP_RAW_IMU = 102
 MSP_RC = 105
 MSP_ATTITUDE = 108
@@ -29,11 +42,7 @@ MSP_SET_MOTOR = 214
 MSP_SET_ACC_TRIM = 239
 MSP_ACC_TRIM = 240
 MSP_EEPROM_WRITE = 250
-MSP_SET_POS = 216
 MSP_SET_COMMAND = 217
-MSP_SET_1WIRE = 243
-MSP_VARIO = 122  # Example MSP command for vario (check your drone's documentation for the correct value)
-RETRY_COUNT = 3
 FRAME_MAX_AGE = 0.5  # seconds: getters wait for a newer reply than this
 
 # WS2812B RGB LED strip (needs MagisV2 firmware with MSP 225 / 226)
@@ -48,6 +57,15 @@ MSP_SET_ALT_HOLD = 227  # [int32 cm]: same as setDesiredPosition(Z, cm) in Pluto
 HEIGHT_MAX_CM = 10000   # 100 m: catches values passed in mm by mistake
 
 MSP_MOTOR_COUNT = 8     # MSP_SET_MOTOR always carries 8 motors (the firmware reads 8)
+
+# Flight status and height ceiling (MagisV2)
+MSP_MAX_ALT = 123        # reply: int16 ceiling in cm, -1 = none
+MSP_SET_MAX_ALT = 218    # [int16 cm], -1 = no ceiling; applies in altitude hold, until reboot
+MSP_FLIGHT_STATUS = 255  # reply: uint16 with one bit set, the drone's highest-priority state
+FLIGHT_STATUS_NAMES = ['ACCEL_GYRO_CALIBRATION', 'MAG_CALIBRATION', 'ARMED', 'OK_TO_ARM',
+                       'NOT_OK_TO_ARM', 'SIGNAL_LOSS', 'CRASH', 'LOW_BATTERY',
+                       'LOW_BATTERY_IN_FLIGHT']
+REQUEST_REUSE_AGE = 0.1  # s: on-demand replies younger than this are reused (<= 10 requests/s)
 
 # Why the drone may refuse these ($M!). Firmware without the plutocontrol extensions
 # (225-227) refuses them as unknown and nothing else happens; other functions still work.
@@ -80,6 +98,7 @@ class Pluto:
         # Connection state
         self.connected = False
         self.cam_connected = False
+        self.camera_mode = False
         self.TCP_IP = ip
         self.TCP_PORT = port
         
@@ -120,6 +139,8 @@ class Pluto:
         self._frames_cv = Condition()  # wakes getters waiting for a new reply
         self._rejected_cmds = set()    # MSP commands the drone answered with an error
         self._not_connected_logged = False
+        self._fw_v2 = None             # True: MagisV2, False: older Magis, None: no MSP_ANALOG reply yet
+        self._motor_test_used = False  # motor_speed() left non-idle values on a MagisV2 drone
 
         # Developer Mode (Serial Debug)
         self.dev_mode_enabled = False
@@ -172,18 +193,21 @@ class Pluto:
         self._stop_event.set()
         print(f"Connection to drone lost ({reason}). Call connect() to reconnect.")
         self._close_socket()
+        self._clear_battery_cache()
         with self._frames_cv:
             self._frames_cv.notify_all()
         
-    def connect(self) -> None:
+    def connect(self) -> bool:
         """
         Establish a TCP connection to the drone and start the communication thread.
-        
+
         Default IP: 192.168.4.1
         Default Port: 23
-        
-        Raises:
-            socket.timeout: If connection fails to establish within 5 seconds.
+
+        Errors are printed, not raised (for example no answer within 5 seconds).
+
+        Returns:
+            bool: True if connected (or already connected), False if it failed.
         """
         if not self.connected:
             self._join_threads()  # threads of a lost link may still be finishing
@@ -202,6 +226,8 @@ class Pluto:
                 self._led_inflight = False
                 self._pending_height = None
                 self._not_connected_logged = False
+                self._fw_v2 = None  # learnt again from the first MSP_ANALOG reply
+                self._clear_battery_cache()
                 self.connected = True
                 print(f"Connected to drone at {self.TCP_IP}:{self.TCP_PORT}")
                 self.start_write_function()
@@ -213,13 +239,34 @@ class Pluto:
                 print(f"Error connecting to server: {e}")
                 self.connected = False
                 self._close_socket()
+        return self.connected
+
+    def _magis_v2(self) -> bool:
+        """
+        True for MagisV2 firmware (10-byte MSP_ANALOG reply), False for older Magis (7 bytes).
+
+        Right after connect() it waits up to 1 s for the first reply. Without one (not
+        connected, or no telemetry) it assumes MagisV2, the library's default.
+        """
+        if self._fw_v2 is None and self.connected:
+            self._get_frame(MSP_ANALOG, 7)  # the reader thread sets _fw_v2
+        return self._fw_v2 is not False
+
+    def _clear_motor_test(self) -> None:
+        """MagisV2 keeps motor_speed() values and spins them whenever disarmed: set all idle."""
+        if self._motor_test_used and self._magis_v2():
+            self.send_request_msp_set_motor([RC_MIN] * 4)
+            self._motor_test_used = False
 
     def disconnect(self) -> None:
         """
         Disconnect from the drone and stop the background communication thread.
         Cleanly closes the socket and releases resources.
+
+        On MagisV2, motors left spinning by motor_speed() are set back to idle first.
         """
         if self.connected:
+            self._clear_motor_test()
             # Let queued LED packets (e.g. a final led_release) go out first
             if self._led_queue or self._led_inflight:
                 # ~22 ms per packet; allow 50 ms each for slow timers / Wi-Fi
@@ -238,6 +285,7 @@ class Pluto:
                 self.reader_thread.join(timeout=1.0)
             with self._frames_cv:
                 self._frames_cv.notify_all()
+            self._clear_battery_cache()
 
             print("Disconnected from drone")
 
@@ -261,6 +309,7 @@ class Pluto:
         The drone will not spin motors until throttle is raised, but it is ready to fly.
         """
         print("Arming")
+        self._clear_motor_test()
         with self._lock:
             self.rcRoll = 1500
             self.rcYaw = 1500
@@ -276,6 +325,7 @@ class Pluto:
         Use with caution.
         """
         print("boxarm")
+        self._clear_motor_test()
         with self._lock:
             self.rcRoll = 1500
             self.rcYaw = 1500
@@ -318,51 +368,85 @@ class Pluto:
             self.rcAUX2 = 1000
         self.dev_mode_enabled = False
         
-    def forward(self) -> None:
-        """Set Pitch to 1600 (Move Forward)."""
-        print("Forward")
-        with self._lock:
-            self.rcPitch = 1600
+    # Movement: each call holds its stick at 1500 +/- strength until reset() or another
+    # call. On MagisV2 every direction defaults to 200, so opposite moves are equally
+    # strong. Older Magis firmware keeps its original defaults (LEGACY_MOVE_OFFSET).
 
-    def backward(self) -> None:
-        """Set Pitch to 1300 (Move Backward)."""
-        print("Backward")
-        with self._lock:
-            self.rcPitch = 1300
+    @staticmethod
+    def _in_range(name: str, value, low: int, high: int) -> bool:
+        if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high:
+            return True
+        print(f"Invalid {name} {value!r}. Must be an integer {low}-{high}.")
+        return False
 
-    def left(self) -> None:
-        """Set Roll to 1200 (Move Left)."""
-        print("Left Roll")
-        with self._lock:
-            self.rcRoll = 1200
+    def _move_offset(self, move: str, strength: Optional[int]) -> Optional[int]:
+        """Stick offset for a move, or None (with a message) if `strength` is invalid."""
+        if strength is None:
+            return MOVE_STRENGTH_DEFAULT if self._magis_v2() else LEGACY_MOVE_OFFSET[move]
+        if self._in_range("strength", strength, 0, MOVE_STRENGTH_MAX):
+            return strength
+        return None
 
-    def right(self) -> None:
-        """Set Roll to 1600 (Move Right)."""
-        print("Right Roll")
-        with self._lock:
-            self.rcRoll = 1600
+    def forward(self, strength: Optional[int] = None) -> None:
+        """Move forward: pitch = 1500 + strength (int 0-500; default 200 on MagisV2, 100 on older Magis)."""
+        offset = self._move_offset('forward', strength)
+        if offset is not None:
+            print("Forward")
+            with self._lock:
+                self.rcPitch = RC_CENTER + offset
 
-    def left_yaw(self) -> None:
-        """Set Yaw to 1300 (Rotate Left)."""
-        print("Left Yaw")
-        with self._lock:
-            self.rcYaw = 1300
+    def backward(self, strength: Optional[int] = None) -> None:
+        """Move backward: pitch = 1500 - strength (int 0-500; default 200)."""
+        offset = self._move_offset('backward', strength)
+        if offset is not None:
+            print("Backward")
+            with self._lock:
+                self.rcPitch = RC_CENTER - offset
 
-    def right_yaw(self) -> None:
-        """Set Yaw to 1600 (Rotate Right)."""
-        print("Right Yaw")
-        with self._lock:
-            self.rcYaw = 1600
+    def left(self, strength: Optional[int] = None) -> None:
+        """Move left: roll = 1500 - strength (int 0-500; default 200 on MagisV2, 300 on older Magis)."""
+        offset = self._move_offset('left', strength)
+        if offset is not None:
+            print("Left Roll")
+            with self._lock:
+                self.rcRoll = RC_CENTER - offset
+
+    def right(self, strength: Optional[int] = None) -> None:
+        """Move right: roll = 1500 + strength (int 0-500; default 200 on MagisV2, 100 on older Magis)."""
+        offset = self._move_offset('right', strength)
+        if offset is not None:
+            print("Right Roll")
+            with self._lock:
+                self.rcRoll = RC_CENTER + offset
+
+    def left_yaw(self, strength: Optional[int] = None) -> None:
+        """Rotate left: yaw = 1500 - strength (int 0-500; default 200)."""
+        offset = self._move_offset('left_yaw', strength)
+        if offset is not None:
+            print("Left Yaw")
+            with self._lock:
+                self.rcYaw = RC_CENTER - offset
+
+    def right_yaw(self, strength: Optional[int] = None) -> None:
+        """Rotate right: yaw = 1500 + strength (int 0-500; default 200 on MagisV2, 100 on older Magis)."""
+        offset = self._move_offset('right_yaw', strength)
+        if offset is not None:
+            print("Right Yaw")
+            with self._lock:
+                self.rcYaw = RC_CENTER + offset
 
     def reset(self) -> None:
-        """Reset all RC channels to neutral (1500)."""
+        """
+        Reset roll, pitch, yaw and throttle to neutral (1500).
+
+        A take_off() or land() that has not gone out yet is still sent.
+        """
         print("Reset RC")
         with self._lock:
             self.rcRoll = 1500
             self.rcThrottle = 1500
             self.rcPitch = 1500
             self.rcYaw = 1500
-            self.command_type = self.NONE_COMMAND
 
     def increase_height(self) -> None:
         """Increase Throttle to 1800 (Ascend)."""
@@ -380,11 +464,26 @@ class Pluto:
         """
         Command the drone to Take Off.
         Switches to Auto-Takeoff mode.
+
+        MagisV2: arms with the sticks centred (throttle 1500), which the firmware needs
+        to take off; the drone then climbs to its take-off height (120 cm) and holds it.
+        Older Magis: throttle 1800, as before.
         """
         print("Take off")
-        self.disarm()
-        self.box_arm()
+        if not self._magis_v2():
+            self.disarm()
+            self.box_arm()
+            with self._lock:
+                self.command_type = self.TAKE_OFF
+            return
+        self._clear_motor_test()
+        # One update, so the writer never sends a frame in between (e.g. a disarm)
         with self._lock:
+            self.rcRoll = RC_CENTER
+            self.rcPitch = RC_CENTER
+            self.rcYaw = RC_CENTER
+            self.rcThrottle = RC_CENTER
+            self.rcAUX4 = 1500
             self.command_type = self.TAKE_OFF
 
     def land(self) -> None:
@@ -396,7 +495,7 @@ class Pluto:
         with self._lock:
             self.command_type = self.LAND
 
-    def rc_values(self) -> list[int]:
+    def rc_values(self) -> List[int]:
         """Returns the current RC channel values."""
         return [self.rcRoll, self.rcPitch, self.rcThrottle, self.rcYaw,
                 self.rcAUX1, self.rcAUX2, self.rcAUX3, self.rcAUX4]
@@ -408,30 +507,34 @@ class Pluto:
         Args:
             index (int): Motor index (0-3).
             value (int): PWM value (1000-2000).
+
+        Anything else (out of range, float, bool, str) is refused with a message and
+        nothing is sent.
+
+        This is a motor test: it spins the motor only while the drone is disarmed, and
+        the motor keeps spinning until motor_speed(index, 1000), arm(), take_off() or
+        disconnect(). On MagisV2 it is refused while armed, because the drone would keep
+        the value and spin the motor as soon as it disarms.
         """
+        if not (self._in_range("motor index", index, 0, 3)
+                and self._in_range("motor speed", value, RC_MIN, RC_MAX)):
+            return
+        if self._refuse_if_armed("motor_speed"):
+            return
+        magis_v2 = self._magis_v2()
         print(f"Set motor {index} speed to {value}")
-        if 0 <= index < 4:
-            # Create a list of 4 motor speeds (defaulting to 1000/Idle)
-            # Todo: Ideally reading current state would be better.
-            motor_speeds = [1000, 1000, 1000, 1000]
-            motor_speeds[index] = value
-            
-            self.send_request_msp_set_motor(motor_speeds)  # padded to the 8 motors the firmware reads
-        else:
-            print("Invalid motor index. Must be between 0 and 3.")
+        # The other motors are sent as 1000 (idle). Todo: keep their current values instead.
+        motor_speeds = [RC_MIN] * 4
+        motor_speeds[index] = value
+        self.send_request_msp_set_motor(motor_speeds)  # padded to the 8 motors the firmware reads
+        if magis_v2:
+            self._motor_test_used = value != RC_MIN
 
     # ── WS2812B RGB LEDs ────────────────────────────────────────────────────
     # Needs MagisV2 firmware with MSP 225 / 226. Packets are queued and sent by the
     # background thread at most one per ~22 ms cycle (~45 per second), in place of a
     # telemetry request, so LED traffic never adds to the drone's MSP load. Calls
     # return at once; wait_leds() waits until everything queued has been sent.
-
-    @staticmethod
-    def _in_range(name: str, value, low: int, high: int) -> bool:
-        if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high:
-            return True
-        print(f"Invalid {name} {value!r}. Must be an integer {low}-{high}.")
-        return False
 
     def _writer_alive(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
@@ -529,9 +632,9 @@ class Pluto:
         Works like setDesiredPosition(Z, cm) in PlutoPilot.cpp: the drone climbs or
         descends to the new height smoothly and holds it. Call it after take-off: take-off
         sets its own target (120 cm) and replaces an earlier one. Keep the throttle
-        centred (reset() sets 1500): moving the throttle stick takes over from the
-        target, and take_off() leaves the throttle at 1800. A max-altitude ceiling
-        still applies.
+        centred (take_off() and reset() leave it at 1500): moving the throttle stick
+        (increase_height(), decrease_height()) takes over from the target. A
+        max-altitude ceiling still applies.
 
         Sent by the background thread in place of one telemetry request, like the LED
         commands. Calling it again before it has gone out replaces the pending value, so
@@ -559,21 +662,26 @@ class Pluto:
         Args:
             roll (int): Roll trim value (-1000 to 1000).
             pitch (int): Pitch trim value (-1000 to 1000).
+
+        Anything else (out of range, float, bool, str) is refused with a message and
+        nothing is sent.
         """
-        roll = max(min(roll, TRIM_MAX), TRIM_MIN)
-        pitch = max(min(pitch, TRIM_MAX), TRIM_MIN)
+        if not (self._in_range("roll trim", roll, TRIM_MIN, TRIM_MAX)
+                and self._in_range("pitch trim", pitch, TRIM_MIN, TRIM_MAX)):
+            return
         self.send_request_msp_set_acc_trim(roll, pitch)
             
     def send_request_msp(self, data) -> bool:
         """Send one MSP packet (hex string). Returns False if it could not be sent."""
-        if not self.connected:
+        client = self.client
+        if not self.connected or client is None:
             self._warn_not_connected()
             return False
         try:
             # sendall: send() may write part of a packet; the lock keeps packets from the
             # writer thread and from user calls from interleaving on the socket.
             with self._send_lock:
-                self.client.sendall(bytes.fromhex(data))
+                client.sendall(bytes.fromhex(data))
             return True
         except OSError as e:  # includes socket.timeout
             self._link_lost(e)
@@ -655,11 +763,16 @@ class Pluto:
             self._link_lost(f"writer thread error: {e!r}")
 
     def _write_loop(self):
-        requests = [MSP_RC, MSP_ATTITUDE, MSP_RAW_IMU, MSP_ALTITUDE, MSP_ANALOG]
+        # MSP_RC's reply is never read. MagisV2 drones are not asked for it, which leaves
+        # them more room (they serve one MSP command per 3.5 ms); older Magis still are.
+        requests_v2 = [MSP_ATTITUDE, MSP_RAW_IMU, MSP_ALTITUDE, MSP_ANALOG]
+        requests_legacy = [MSP_RC] + requests_v2
         slot_skip = 0  # telemetry request that gives its slot to the next height / LED packet
         self.send_request_msp_acc_trim()
 
         while self.connected and not self._stop_event.is_set():
+            requests = requests_v2 if self._fw_v2 else requests_legacy
+            slot_skip %= len(requests)
             # Thread-safe copy of RC values
             with self._lock:
                 self.droneRC[:] = self.rc_values()
@@ -673,7 +786,7 @@ class Pluto:
             self.send_request_msp_set_raw_rc(self.droneRC)
 
             # A height target or a queued LED packet replaces one telemetry request
-            # (rotating), so this loop still sends 6 packets per cycle. The drone serves one
+            # (rotating), so this loop never sends more packets per cycle. The drone serves one
             # MSP command per 3.5 ms loop (~285/s) and overwrites its 256-byte receive buffer
             # when it falls behind, which would garble the RC frames above.
             cycle_requests = requests
@@ -704,149 +817,258 @@ class Pluto:
             time.sleep(0.022)  # ~45Hz update rate
 
     # ── Telemetry ───────────────────────────────────────────────────────────
-    # The writer thread asks for RC, ATTITUDE, RAW_IMU, ALTITUDE and ANALOG every cycle
-    # and the reader thread keeps the latest reply of each, so these getters add no MSP
-    # traffic and always return current data.
+    # The writer thread asks for ATTITUDE, RAW_IMU, ALTITUDE and ANALOG every cycle and
+    # the reader thread keeps the latest reply of each, so these getters add no MSP
+    # traffic and always return current data. Without current data (not connected, or
+    # nothing from the drone for 1 s) they return None, never a made-up 0.
 
-    def get_height(self) -> int:
+    def get_height(self) -> Optional[int]:
         """
         Get the current height of the drone.
 
         Returns:
-            int: Estimated altitude in cm (0 if no data).
+            int or None: Estimated altitude in cm, None if no data.
         """
         height = self._field(MSP_ALTITUDE, 0, 4)  # int32, cm
         if height is None:
-            return 0
+            return None
         print(f"height: {height} cm")
         return height
 
-    def get_vario(self) -> int:
+    def get_vario(self) -> Optional[int]:
         """
         Get the vertical speed.
 
         Returns:
-            int: Variometer reading in cm/s (0 if no data).
+            int or None: Variometer reading in cm/s, None if no data.
         """
-        vario = self._field(MSP_ALTITUDE, 4)
-        return 0 if vario is None else vario
+        return self._field(MSP_ALTITUDE, 4)
 
-    def get_roll(self) -> float:
+    def get_roll(self) -> Optional[float]:
         """
         Get the current Roll angle.
 
         Returns:
-            float: Roll angle in degrees.
+            float or None: Roll angle in degrees, None if no data.
         """
         roll = self._field(MSP_ATTITUDE, 0)  # deci-degrees
         if roll is None:
-            return 0.0
+            return None
         roll = roll / 10
         print(f"roll: {roll} degrees")
         return roll
 
-    def get_pitch(self) -> float:
+    def get_pitch(self) -> Optional[float]:
         """
         Get the current Pitch angle.
 
         Returns:
-            float: Pitch angle in degrees.
+            float or None: Pitch angle in degrees, None if no data.
         """
         pitch = self._field(MSP_ATTITUDE, 2)  # deci-degrees
         if pitch is None:
-            return 0.0
+            return None
         pitch = pitch / 10
         print(f"pitch: {pitch} degrees")
         return pitch
 
-    def get_yaw(self) -> float:
+    def get_yaw(self) -> Optional[float]:
         """
         Get the current Yaw angle.
 
         Returns:
-            float: Yaw angle in degrees.
+            float or None: Yaw angle in degrees, None if no data.
         """
         yaw = self._field(MSP_ATTITUDE, 4)  # heading, degrees
         if yaw is None:
-            return 0.0
+            return None
         print(f"yaw: {yaw} degrees")
         return float(yaw)
 
-    def _imu(self, index: int) -> int:
-        """RAW_IMU value: 0-2 accelerometer, 3-5 gyroscope, 6-8 magnetometer."""
-        value = self._field(MSP_RAW_IMU, index * 2)
-        return 0 if value is None else value
+    def _imu(self, index: int) -> Optional[int]:
+        """RAW_IMU value: 0-2 accelerometer, 3-5 gyroscope, 6-8 magnetometer. None if no data."""
+        return self._field(MSP_RAW_IMU, index * 2)
 
-    def get_acc_x(self) -> int:
-        """Get raw Accelerometer X value (signed 16-bit)."""
+    def get_acc_x(self) -> Optional[int]:
+        """Get raw Accelerometer X value (signed 16-bit), None if no data."""
         return self._imu(0)
 
-    def get_acc_y(self) -> int:
-        """Get raw Accelerometer Y value (signed 16-bit)."""
+    def get_acc_y(self) -> Optional[int]:
+        """Get raw Accelerometer Y value (signed 16-bit), None if no data."""
         return self._imu(1)
 
-    def get_acc_z(self) -> int:
-        """Get raw Accelerometer Z value (signed 16-bit)."""
+    def get_acc_z(self) -> Optional[int]:
+        """Get raw Accelerometer Z value (signed 16-bit), None if no data."""
         return self._imu(2)
 
-    def get_gyro_x(self) -> int:
-        """Get raw Gyroscope X value (signed 16-bit)."""
+    def get_gyro_x(self) -> Optional[int]:
+        """Get raw Gyroscope X value (signed 16-bit), None if no data."""
         return self._imu(3)
 
-    def get_gyro_y(self) -> int:
-        """Get raw Gyroscope Y value (signed 16-bit)."""
+    def get_gyro_y(self) -> Optional[int]:
+        """Get raw Gyroscope Y value (signed 16-bit), None if no data."""
         return self._imu(4)
 
-    def get_gyro_z(self) -> int:
-        """Get raw Gyroscope Z value (signed 16-bit)."""
+    def get_gyro_z(self) -> Optional[int]:
+        """Get raw Gyroscope Z value (signed 16-bit), None if no data."""
         return self._imu(5)
 
-    def get_mag_x(self) -> int:
-        """Get raw Magnetometer X value (signed 16-bit)."""
+    def get_mag_x(self) -> Optional[int]:
+        """Get raw Magnetometer X value (signed 16-bit), None if no data."""
         return self._imu(6)
 
-    def get_mag_y(self) -> int:
-        """Get raw Magnetometer Y value (signed 16-bit)."""
+    def get_mag_y(self) -> Optional[int]:
+        """Get raw Magnetometer Y value (signed 16-bit), None if no data."""
         return self._imu(7)
 
-    def get_mag_z(self) -> int:
-        """Get raw Magnetometer Z value (signed 16-bit)."""
+    def get_mag_z(self) -> Optional[int]:
+        """Get raw Magnetometer Z value (signed 16-bit), None if no data."""
         return self._imu(8)
+
+    def _refuse_if_armed(self, what: str) -> bool:
+        """
+        MagisV2: True (with a message) if the drone is armed, i.e. AUX4 was last set in
+        the ARM range. The library is the drone's only RC source, so below it the drone
+        cannot be armed.
+        """
+        if self._magis_v2() and self.rcAUX4 >= ARM_AUX_MIN:
+            print(f"{what} refused: the drone is armed. Call disarm() first.")
+            return True
+        return False
 
     def calibrate_acceleration(self) -> None:
         """
         Calibrate the Accelerometer.
-        
-        The drone must be placed on a flat, level surface before calling this.
-        Motors should be disarmed.
+
+        The drone must be placed on a flat, level surface and kept still for a few
+        seconds while it calibrates.
+
+        The drone ignores this while armed, without an error. On MagisV2 it is therefore
+        refused while armed: call disarm() first.
         """
-        self.send_request_msp(self.create_packet_msp(MSP_ACC_CALIBRATION, []))
+        if not self._refuse_if_armed("calibrate_acceleration"):
+            self.send_request_msp(self.create_packet_msp(MSP_ACC_CALIBRATION, []))
 
     def calibrate_magnetometer(self) -> None:
         """
         Calibrate the Magnetometer.
-        
-        Follow the calibration procedure (rotating the drone) after calling this.
-        Motors should be disarmed.
-        """
-        self.send_request_msp(self.create_packet_msp(MSP_MAG_CALIBRATION, []))
 
-    def get_battery(self) -> float:
+        Follow the calibration procedure (rotating the drone) after calling this.
+
+        The drone ignores this while armed, without an error. On MagisV2 it is therefore
+        refused while armed: call disarm() first.
+        """
+        if not self._refuse_if_armed("calibrate_magnetometer"):
+            self.send_request_msp(self.create_packet_msp(MSP_MAG_CALIBRATION, []))
+
+    # ── Flight status and height ceiling (MagisV2) ──────────────────────────
+
+    def _requires_magis_v2(self, what: str) -> bool:
+        if self._magis_v2():
+            return True
+        print(f"{what}: needs MagisV2 firmware")
+        return False
+
+    def _request(self, cmd: int, min_size: int) -> Optional[bytes]:
+        """
+        Ask the drone for `cmd` (not in the writer's telemetry rotation) and wait up to 1 s.
+
+        A reply younger than REQUEST_REUSE_AGE is reused, so calling in a loop adds at
+        most ~10 requests per second to the drone's MSP load.
+        """
+        with self._frames_cv:
+            frame = self._frames.get(cmd)
+            if frame and time.monotonic() - frame[1] <= REQUEST_REUSE_AGE and len(frame[0]) >= min_size:
+                return frame[0]
+            self._frames.pop(cmd, None)  # only the reply to this request counts
+        if not self.send_request_msp(self.create_packet_msp(cmd, [])):
+            return None
+        return self._get_frame(cmd, min_size)
+
+    def get_flight_status(self) -> Optional[str]:
+        """
+        The drone's flight status, as the Pluto app shows it (MagisV2).
+
+        The drone reports its single most important state, in this order: calibrating,
+        crash, low battery, signal loss, not OK to arm, OK to arm, armed. Use it to find
+        out why arm() or take_off() did nothing.
+
+        Returns:
+            str or None: 'ACCEL_GYRO_CALIBRATION', 'MAG_CALIBRATION', 'CRASH',
+            'LOW_BATTERY', 'LOW_BATTERY_IN_FLIGHT', 'SIGNAL_LOSS', 'NOT_OK_TO_ARM',
+            'OK_TO_ARM' or 'ARMED'; None if no reply.
+        """
+        if not self._requires_magis_v2("get_flight_status"):
+            return None
+        data = self._request(MSP_FLIGHT_STATUS, 2)
+        if data is None:
+            return None
+        flags = int.from_bytes(data[:2], 'little')
+        if flags == 0:
+            return 'UNKNOWN'
+        bit = (flags & -flags).bit_length() - 1
+        return FLIGHT_STATUS_NAMES[bit] if bit < len(FLIGHT_STATUS_NAMES) else f'UNKNOWN_{flags}'
+
+    def is_armed(self) -> Optional[bool]:
+        """
+        Whether the drone is armed, from its flight status (MagisV2).
+
+        Returns:
+            bool or None: True if it reports ARMED, False if it reports OK_TO_ARM,
+            NOT_OK_TO_ARM or a calibration. None if there is no reply, or a more important
+            state (crash, low battery, signal loss) hides whether it is armed.
+        """
+        status = self.get_flight_status()
+        if status == 'ARMED':
+            return True
+        if status in ('OK_TO_ARM', 'NOT_OK_TO_ARM', 'ACCEL_GYRO_CALIBRATION', 'MAG_CALIBRATION'):
+            return False
+        return None
+
+    def set_max_height(self, height_cm: Optional[int]) -> None:
+        """
+        Set a height ceiling in cm (MagisV2), or remove it with None.
+
+        In altitude hold the drone does not climb above it. The drone keeps it until it
+        reboots.
+
+        Args:
+            height_cm (int or None): Ceiling in cm (0-10000), None for no ceiling.
+        """
+        if height_cm is not None and not self._in_range("max height", height_cm, 0, HEIGHT_MAX_CM):
+            return
+        if self._requires_magis_v2("set_max_height"):
+            value = -1 if height_cm is None else height_cm
+            self.send_request_msp(self.create_packet_msp(MSP_SET_MAX_ALT, [value]))
+
+    def get_max_height(self) -> Optional[int]:
+        """
+        The drone's height ceiling in cm (MagisV2).
+
+        Returns:
+            int or None: Ceiling in cm, -1 if there is none, None if no reply.
+        """
+        if not self._requires_magis_v2("get_max_height"):
+            return None
+        data = self._request(MSP_MAX_ALT, 2)
+        return None if data is None else int.from_bytes(data[:2], 'little', signed=True)
+
+    def get_battery(self) -> Optional[float]:
         """
         Get the current battery voltage.
 
         Returns:
-            float: Battery voltage in Volts (the BMS's compensated voltage on Protocol V1
-            boards), 0.0 if no data.
+            float or None: Battery voltage in Volts (the BMS's compensated voltage on
+            Protocol V1 boards), None if no data.
         """
         telemetry = self.get_analog_telemetry()
         if not telemetry:
-            return 0.0
+            return None
         if self.MSP_Protocol_Version == 1:
             return telemetry['vBatComp']
         return telemetry['bytevbat']
 
-    def get_battery_percentage(self) -> float:
+    def get_battery_percentage(self) -> Optional[float]:
         """
         Get the battery percentage.
 
@@ -855,11 +1077,11 @@ class Pluto:
         voltage (3.7 V = 0 %, 4.2 V = 100 %).
 
         Returns:
-            float: 0.0 to 100.0 (0.0 if no data).
+            float or None: 0.0 to 100.0, None if no data.
         """
         telemetry = self.get_analog_telemetry()
         if not telemetry:
-            return 0.0
+            return None
         if self.MSP_Protocol_Version == 1:
             return float(telemetry['soc_Fused'])
         voltage = telemetry['bytevbat']
@@ -876,7 +1098,9 @@ class Pluto:
         Without it the replies to the writer's requests pile up unread and the getters
         would read data that is seconds old.
         """
-        silent_seconds = 0
+        last_data = time.monotonic()
+        got_data = False  # the drone has answered on this link
+        warned = False
         while self.connected and not self._stop_event.is_set():
             client = self.client
             if client is None:
@@ -884,9 +1108,17 @@ class Pluto:
             try:
                 data = client.recv(4096)
             except socket.timeout:
-                silent_seconds += 1
-                if silent_seconds == 3:
-                    print("Warning: no data from the drone for 3 seconds (Wi-Fi link down?)")
+                if time.monotonic() - last_data < LINK_TIMEOUT or client is not self.client:
+                    continue
+                if got_data:
+                    # A Wi-Fi drop often closes nothing: TCP would keep the link "up" for
+                    # minutes while the drone hears nothing. The drone answered every cycle
+                    # until now, so silence this long means the link is gone.
+                    self._link_lost(f"no data from the drone for {LINK_TIMEOUT:.0f} s, Wi-Fi link down?")
+                elif not warned:
+                    # Never answered: keep sending (a bridge might not relay replies)
+                    print(f"Warning: no data from the drone for {LINK_TIMEOUT:.0f} seconds (Wi-Fi link down?)")
+                    warned = True
                 continue
             except OSError as e:
                 if client is self.client:  # not a socket left over from a previous link
@@ -896,7 +1128,8 @@ class Pluto:
                 if client is self.client:
                     self._link_lost("the drone closed the connection")
                 continue
-            silent_seconds = 0
+            last_data = time.monotonic()
+            got_data = True
             try:
                 self._parse_rx(data)
             except Exception as e:  # a parser bug must not stop telemetry for good
@@ -971,6 +1204,8 @@ class Pluto:
         print(f"Drone rejected MSP command {cmd} ({hint})")
 
     def _store_frame(self, cmd: int, payload: bytes) -> None:
+        if cmd == MSP_ANALOG:
+            self._fw_v2 = len(payload) >= 10  # MagisV2 sends 10 bytes, older Magis 7
         with self._frames_cv:
             self._frames[cmd] = (payload, time.monotonic())
             self._frames_cv.notify_all()
@@ -1087,200 +1322,222 @@ class Pluto:
             'protocol_version': self.MSP_Protocol_Version
         }
 
-    def get_battery_voltage_compensated(self) -> float:
-        """Get compensated battery voltage (Volts)."""
-        self.get_analog_telemetry()
-        if self.MSP_Protocol_Version == 1:
-            return self.vBatComp / 1000.0
-        else:
-            return self.bytevbat / 10.0
+    # The drone (MagisV2) sends its battery values ready to use: state of charge, mAh and
+    # its warning come from its own BMS and are returned as sent. The helpers below read
+    # one fresh MSP_ANALOG reply and return None without one, never a cached or made-up
+    # value. Values the connected firmware does not send are None too.
 
-    def get_current_mA(self) -> int:
-        """Get current draw (mA)."""
-        self.get_analog_telemetry()
-        if self.MSP_Protocol_Version == 1:
-            return self.mAmpRaw
-        else:
-            return self.amperage
+    def _analog(self, key_v2: Optional[str], key_legacy: Optional[str] = None):
+        """One value from a fresh MSP_ANALOG reply (MagisV2 key, older-Magis key), or None."""
+        telemetry = self.get_analog_telemetry()
+        if telemetry is None:
+            return None
+        key = key_v2 if telemetry['protocol_version'] == 1 else key_legacy
+        return telemetry.get(key) if key else None
 
-    def get_capacity_drawn_mAh(self) -> int:
-        """Get capacity consumed (mAh)."""
-        self.get_analog_telemetry()
-        return self.mAhDrawn
+    def _clear_battery_cache(self) -> None:
+        """Nothing from a previous link may show up as current battery data."""
+        self.vBatComp = self.mAmpRaw = self.mAhDrawn = self.mAhRemain = 0
+        self.soc_Fused = self.auto_LandMode = 0
+        self.bytevbat = self.pMeterSum = self.rssi = self.amperage = 0
 
-    def get_capacity_remaining_mAh(self) -> int:
-        """Get capacity remaining (mAh)."""
-        self.get_analog_telemetry()
-        return self.mAhRemain
+    def get_battery_voltage_compensated(self) -> Optional[float]:
+        """Get compensated battery voltage (Volts), None if no data."""
+        return self._analog('vBatComp', 'bytevbat')
 
-    def get_state_of_charge(self) -> int:
-        """Get State of Charge (0-100%)."""
-        self.get_analog_telemetry()
-        return self.soc_Fused
+    def get_current_mA(self) -> Optional[int]:
+        """Get current draw (mA), None if no data."""
+        return self._analog('mAmpRaw', 'amperage')
 
-    def get_auto_land_status(self) -> int:
-        """Get Auto-Land status (1=Active, 0=Inactive)."""
-        self.get_analog_telemetry()
-        return self.auto_LandMode
-    
-    def get_rssi(self):
-        """Get signal strength RSSI"""
-        self.get_analog_telemetry()
-        return self.rssi
-    
-    def get_power_meter_sum(self):
-        """Get power meter sum"""
-        self.get_analog_telemetry()
-        return self.pMeterSum
-    
-    def get_battery_info(self) -> Optional[Dict[str, Union[str, int, float, str]]]:
+    def get_capacity_drawn_mAh(self) -> Optional[int]:
+        """Get capacity consumed (mAh) as the drone reports it, None if no data (MagisV2 only)."""
+        return self._analog('mAhDrawn')
+
+    def get_capacity_remaining_mAh(self) -> Optional[int]:
+        """Get capacity remaining (mAh) as the drone reports it, None if no data (MagisV2 only)."""
+        return self._analog('mAhRemain')
+
+    def get_state_of_charge(self) -> Optional[int]:
+        """Get the drone's State of Charge (0-100%), None if no data (MagisV2 only)."""
+        return self._analog('soc_Fused')
+
+    def get_auto_land_status(self) -> Optional[int]:
+        """
+        Get the drone's battery warning code as sent: 0 OK, 1 WARNING, 2 CRITICAL.
+
+        None if no data (MagisV2 only). Despite the name this is not an auto-land state:
+        see get_battery_warning().
+        """
+        return self._analog('auto_LandMode')
+
+    def get_rssi(self) -> Optional[int]:
+        """Get signal strength RSSI, None if no data (older Magis only)."""
+        return self._analog(None, 'rssi')
+
+    def get_power_meter_sum(self) -> Optional[int]:
+        """Get power meter sum, None if no data (older Magis only)."""
+        return self._analog(None, 'pMeterSum')
+
+    def get_battery_info(self) -> Optional[Dict[str, Any]]:
         """
         Get comprehensive battery information.
         
         Returns:
-            dict: Dictionary containing battery telemetry.
+            dict or None: Dictionary containing battery telemetry, None if no data.
                   Structure depends on MSP_Protocol_Version.
         """
         telemetry = self.get_analog_telemetry()
         if not telemetry:
             return None
             
-        if self.MSP_Protocol_Version == 1:
-             return {
+        if telemetry['protocol_version'] == 1:
+            return {
                 'voltage': f"{telemetry['vBatComp']:.2f}V",
                 'current': f"{telemetry['mAmpRaw']}mA",
                 'capacity_drawn': f"{telemetry['mAhDrawn']}mAh",
                 'capacity_remaining': f"{telemetry['mAhRemain']}mAh",
                 'state_of_charge': f"{telemetry['soc_Fused']}%",
                 'auto_land_mode': telemetry['auto_LandMode'],
+                'battery_warning': self._warning_text(telemetry['auto_LandMode']),
                 'protocol': "V1 (Enhanced)"
             }
-        else:
-             return {
-                'voltage': f"{telemetry['bytevbat']:.2f}V",
-                'current': f"{telemetry.get('amperage', 0)}mA",
-                'rssi': telemetry['rssi'],
-                'power_sum': telemetry['pMeterSum'],
-                'protocol': "Legacy"
-            }
-    
-    def get_battery_level_status(self) -> str:
-        """
-        Get battery level status based on state of charge.
-        
-        Returns:
-            str: 'FULL', 'TWO_BAR', 'ONE_BAR', or 'EMPTY'.
-        """
-        soc = self.get_state_of_charge()
-        
+        return {
+            'voltage': f"{telemetry['bytevbat']:.2f}V",
+            'current': f"{telemetry.get('amperage', 0)}mA",
+            'rssi': telemetry['rssi'],
+            'power_sum': telemetry['pMeterSum'],
+            'protocol': "Legacy"
+        }
+
+    @staticmethod
+    def _level_from_soc(soc: int) -> str:
         if soc >= 70:
             return 'FULL'  # 4 bars - battery_full
-        elif soc >= 40:
+        if soc >= 40:
             return 'TWO_BAR'  # 2 bars - battery_two_bar
-        elif soc >= 20:
+        if soc >= 20:
             return 'ONE_BAR'  # 1 bar - battery_one_bar
-        else:
-            return 'EMPTY'  # Empty - no_battery
-    
-    def get_auto_land_status_text(self) -> str:
+        return 'EMPTY'  # Empty - no_battery
+
+    @staticmethod
+    def _warning_text(code: int) -> str:
+        return BATTERY_WARNING_NAMES.get(code, f'UNKNOWN_{code}')
+
+    def get_battery_level_status(self) -> Optional[str]:
         """
-        Get auto-land mode as human-readable text.
-        
+        Get battery level status based on the drone's state of charge.
+
         Returns:
-            str: 'NORMAL', 'LOW_BATTERY_WARNING', or 'AUTO_LANDING'.
+            str or None: 'FULL', 'TWO_BAR', 'ONE_BAR', or 'EMPTY'; None if no data.
         """
-        auto_land = self.get_auto_land_status()
-        
-        if auto_land == 0:
-            return 'NORMAL'
-        elif auto_land == 1:
-            return 'LOW_BATTERY_WARNING'
-        elif auto_land == 2:
-            return 'AUTO_LANDING'
-        else:
-            return f'UNKNOWN_{auto_land}'
-    
-    def is_battery_critical(self) -> bool:
+        soc = self.get_state_of_charge()
+        return None if soc is None else self._level_from_soc(soc)
+
+    def get_battery_warning(self) -> Optional[str]:
+        """
+        Get the drone's own battery warning (MagisV2).
+
+        The CG tilt firmware sends CRITICAL as WARNING while armed: it is then landing by
+        itself, and the app only warns. No MSP reply tells "auto-landing" apart.
+
+        Returns:
+            str or None: 'OK', 'WARNING' or 'CRITICAL'; None if no data.
+        """
+        code = self.get_auto_land_status()
+        return None if code is None else self._warning_text(code)
+
+    def get_auto_land_status_text(self) -> Optional[str]:
+        """
+        Deprecated: use get_battery_warning(), which this now returns.
+
+        It used to say 'NORMAL', 'LOW_BATTERY_WARNING' or 'AUTO_LANDING', but the drone's
+        code is its battery warning (OK / WARNING / CRITICAL), not an auto-land state.
+        """
+        return self.get_battery_warning()
+
+    def is_battery_critical(self) -> Optional[bool]:
         """
         Check if battery is in critical state (< 20% SOC).
-        
+
         Returns:
-            bool: True if critical, False otherwise.
+            bool or None: True if critical, False otherwise, None if no data.
         """
         soc = self.get_state_of_charge()
-        return soc < 20
-    
-    def is_battery_low(self) -> bool:
+        return None if soc is None else soc < 20
+
+    def is_battery_low(self) -> Optional[bool]:
         """
         Check if battery is low (< 40% SOC).
-        
+
         Returns:
-            bool: True if low, False otherwise.
+            bool or None: True if low, False otherwise, None if no data.
         """
         soc = self.get_state_of_charge()
-        return soc < 40
-    
-    def should_auto_land(self) -> bool:
+        return None if soc is None else soc < 40
+
+    def should_auto_land(self) -> Optional[bool]:
         """
-        Check if auto-land is active (mode == 2).
-        
+        Check if the drone reports a low or critical battery: land now.
+
+        The firmware does not report whether its own auto-land is running (see
+        get_battery_warning()), so this is True on its WARNING or CRITICAL.
+
         Returns:
-            bool: True if auto-landing is triggered.
+            bool or None: True if the drone warns about its battery, None if no data.
         """
-        return self.auto_LandMode == 2
-    
-    def get_battery_status_summary(self) -> Dict[str, Union[str, bool, List[str]]]:
+        code = self.get_auto_land_status()
+        return None if code is None else code >= 1
+
+    def get_battery_status_summary(self) -> Optional[Dict[str, Any]]:
         """
         Get comprehensive battery status summary matching mobile app display.
-        
+
+        Built from one MSP_ANALOG reply, so all values belong together.
+
         Returns:
-            dict: Detailed status including icon, warnings, and flags.
+            dict or None: Detailed status including icon, warnings, and flags; None if no
+            data.
         """
-        self.get_analog_telemetry()  # sets MSP_Protocol_Version from the board's reply
-        if self.MSP_Protocol_Version != 1:
+        telemetry = self.get_analog_telemetry()
+        if telemetry is None:
+            return None
+        if telemetry['protocol_version'] != 1:
             return {
                 'error': 'Enhanced telemetry only available in Protocol V1',
-                'voltage': self.get_battery_voltage_compensated(),
-                'protocol': self.MSP_Protocol_Version
+                'voltage': telemetry['bytevbat'],
+                'protocol': telemetry['protocol_version']
             }
-        
-        voltage = self.get_battery_voltage_compensated()
-        soc = self.get_state_of_charge()
-        capacity_remaining = self.get_capacity_remaining_mAh()
-        battery_level = self.get_battery_level_status()
-        auto_land_status = self.get_auto_land_status_text()
-        
+
+        soc = telemetry['soc_Fused']
+        code = telemetry['auto_LandMode']
+        battery_level = self._level_from_soc(soc)
+        warning = self._warning_text(code)
+
         # Determine status icon/emoji
-        if battery_level == 'FULL':
-            icon = '🔋'  # Full battery
-        elif battery_level == 'TWO_BAR':
-            icon = '🔋'  # Medium battery
-        elif battery_level == 'ONE_BAR':
-            icon = '🪫'  # Low battery
-        else:
-            icon = '🪫'  # Empty battery
-        
+        icon = '🔋' if battery_level in ('FULL', 'TWO_BAR') else '🪫'
+
         # Determine warning message
         warnings = []
-        if auto_land_status == 'AUTO_LANDING':
-            warnings.append('⚠️ AUTO LANDING IN PROGRESS!')
-        elif auto_land_status == 'LOW_BATTERY_WARNING':
+        if warning == 'CRITICAL':
+            warnings.append('⚠️ BATTERY CRITICAL - Land Now!')
+        elif warning == 'WARNING':
             warnings.append('⚠️ LOW BATTERY - Please Land')
-        
+
         if soc < 20:
             warnings.append('🔴 CRITICAL - Land Immediately!')
         elif soc < 40:
             warnings.append('🟡 LOW - Consider Landing')
-        
+
         return {
             'icon': icon,
-            'voltage': f"{voltage:.2f}V",
+            'voltage': f"{telemetry['vBatComp']:.2f}V",
             'soc': f"{soc}%",
-            'capacity_remaining': f"{capacity_remaining}mAh",
+            'capacity_remaining': f"{telemetry['mAhRemain']}mAh",
             'battery_level': battery_level,
-            'auto_land_status': auto_land_status,
+            'battery_warning': warning,
+            'auto_land_status': warning,  # old key, same value as battery_warning
             'warnings': warnings,
-            'is_critical': self.is_battery_critical(),
-            'is_low': self.is_battery_low(),
-            'should_auto_land': self.should_auto_land()
+            'is_critical': soc < 20,
+            'is_low': soc < 40,
+            'should_auto_land': code >= 1
         }
