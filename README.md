@@ -354,10 +354,15 @@ not before take-off, while landing (a landing can't be undone from Python) or du
 flip. A target above the `set_max_height()` ceiling is lowered under it. To go down, use
 `land()`.
 
+`is_height_accepted()` tells whether the drone took the last target: `True`, `False` if it
+refused it, `None` until it has answered (about 50 ms).
+
 ```python
 pluto.take_off()
 time.sleep(4)
 pluto.set_height(80)    # hold 80 cm
+time.sleep(0.2)
+print(pluto.is_height_accepted())   # True: the drone is on its way to 80 cm
 ```
 
 #### `RGB LED strip` (WS2812B)

@@ -135,6 +135,8 @@ class Pluto:
         self._led_queue = deque()  # LED packets, sent by write_function one per cycle
         self._led_inflight = False  # write_function has popped an LED packet and not sent it yet
         self._pending_height = None  # set_height() target (cm) not sent yet; a newer call replaces it
+        self._height_sent_at = None  # time.monotonic() when the last set_height() target went out
+        self._height_reply = None    # (accepted, time.monotonic()) of the drone's last answer to MSP 227
         self._stop_event = Event()  # Signals thread to stop
         self.thread = None
         self.client = None
@@ -233,6 +235,8 @@ class Pluto:
                 self._led_queue.clear()
                 self._led_inflight = False
                 self._pending_height = None
+                self._height_sent_at = None
+                self._height_reply = None
                 self._not_connected_logged = False
                 self._fw_v2 = None  # learnt again from the first MSP_ANALOG reply
                 self._clear_battery_cache()
@@ -653,7 +657,8 @@ class Pluto:
 
         The drone takes it only while flying in altitude hold: not before take-off, while
         landing or during a flip (it answers with an error, printed once). A target above
-        the set_max_height() ceiling is lowered under it.
+        the set_max_height() ceiling is lowered under it. is_height_accepted() tells
+        whether the drone took each target.
         """
         if not self._in_range("height", height_cm, HEIGHT_MIN_CM, HEIGHT_MAX_CM):
             return
@@ -662,6 +667,24 @@ class Pluto:
             return
         with self._lock:
             self._pending_height = height_cm
+
+    def is_height_accepted(self) -> Optional[bool]:
+        """
+        Whether the drone took the last set_height() target.
+
+        Returns:
+            bool or None: True if the drone accepted it, False if it refused it (firmware
+            without MSP 227, or not flying in altitude hold), None while the target has not
+            gone out or the drone has not answered yet (about 50 ms).
+        """
+        with self._lock:
+            if self._pending_height is not None:
+                return None
+            sent_at = self._height_sent_at
+        reply = self._height_reply
+        if sent_at is None or reply is None or reply[1] < sent_at:
+            return None
+        return reply[0]
 
     def trim(self, roll: int, pitch: int) -> None:
         """
@@ -793,6 +816,8 @@ class Pluto:
                     self.command_type = self.NONE_COMMAND
                 height_to_send = self._pending_height
                 self._pending_height = None
+                if height_to_send is not None:
+                    self._height_sent_at = time.monotonic()  # its answer comes after this
 
             # Send commands (outside lock to avoid blocking user code)
             self.send_request_msp_set_raw_rc(self.droneRC)
@@ -1186,6 +1211,8 @@ class Pluto:
                 if checksum != buf[end - 1]:
                     i = start + 1  # corrupt frame: resync on the next '$'
                     continue
+                if cmd == MSP_SET_ALT_HOLD:  # for is_height_accepted()
+                    self._height_reply = (direction == 0x3E, time.monotonic())
                 if direction == 0x3E:
                     self._store_frame(cmd, payload)
                 elif cmd not in self._rejected_cmds:
