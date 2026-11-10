@@ -140,20 +140,20 @@ pluto.disarm()
 #### `Movement Commands`
 
 Each command holds its stick at `1500 +/- strength` until `reset()` or another command
-changes it. `strength` is optional: an integer from 0 to 500. On MagisV2 firmware the
-default is 200 in every direction, so opposite moves are equally strong. Drones with older
-Magis firmware keep their original defaults (shown in brackets below).
+changes it. `strength` is optional: an integer from 0 to 500. On MagisV2 3.0+ the default
+is 200 in every direction, so opposite moves are equally strong. Drones with older firmware
+(Magis, and MagisV2 before 3.0) keep their original defaults (shown in brackets below).
 
 ```python
-#Pitch: move forward / backward (pitch 1700 / 1300) [older Magis: 1600 / 1300].
+#Pitch: move forward / backward (pitch 1700 / 1300) [older firmware: 1600 / 1300].
 pluto.forward()
 pluto.backward()
 
-#Roll: move left / right (roll 1300 / 1700) [older Magis: 1200 / 1600].
+#Roll: move left / right (roll 1300 / 1700) [older firmware: 1200 / 1600].
 pluto.left()
 pluto.right()
 
-#Yaw: rotate left / right (yaw 1300 / 1700) [older Magis: 1300 / 1600].
+#Yaw: rotate left / right (yaw 1300 / 1700) [older firmware: 1300 / 1600].
 pluto.left_yaw()
 pluto.right_yaw()
 
@@ -165,7 +165,7 @@ pluto.left(300)      # roll 1200
 pluto.reset()
 ```
 
-On MagisV2 firmware the library flies in headfree mode (AUX1 = 1500): forward, backward,
+On MagisV2 3.0+ the library flies in headfree mode (AUX1 = 1500): forward, backward,
 left and right stay relative to the drone's starting heading, not to where its nose points
 after a yaw.
 
@@ -191,8 +191,8 @@ pluto.take_off()
 pluto.land()
 ```
 
-On MagisV2 firmware `take_off()` centres the sticks (throttle 1500): the firmware only
-takes off with the throttle centred. Older Magis firmware gets throttle 1800, as before.
+On MagisV2 3.0+ `take_off()` centres the sticks (throttle 1500): the firmware only takes
+off with the throttle centred. Older firmware gets throttle 1800, as before.
 
 #### `Developer Mode`
 Toggle Developer Mode
@@ -211,7 +211,7 @@ from 0 to 3 and `speed` an integer from 1000 to 2000. Anything else is refused w
 message and nothing is sent.
 
 The motor keeps spinning until `motor_speed(index, 1000)`, `arm()`, `take_off()` or
-`disconnect()`. Keep hands clear. On MagisV2 firmware it is refused while armed: the drone
+`disconnect()`. Keep hands clear. On MagisV2 3.0+ it is refused while armed: the drone
 would keep the value and spin the motor as soon as it disarms.
 
 ```Python
@@ -312,7 +312,7 @@ pluto.calibrate_acceleration()
 pluto.calibrate_magnetometer()
 ```
 
-#### `Flight Status` (MagisV2)
+#### `Flight Status` (MagisV2 3.0+)
 
 The drone's own status, as the Pluto app shows it. Use it to find out why `arm()` or
 `take_off()` did nothing. Returns `None` if there is no reply.
@@ -330,7 +330,11 @@ armed = pluto.is_armed()
 The drone reports one state at a time, the most important first: calibrating, crash, low
 battery, signal loss, not OK to arm, OK to arm, armed.
 
-#### `Height Ceiling` (MagisV2)
+A critical battery depends on the firmware: MagisV2 3.0.0 reports `LOW_BATTERY_IN_FLIGHT`
+whether armed or not. The CG tilt firmware reports `LOW_BATTERY` while armed (it is then
+landing by itself) and `LOW_BATTERY_IN_FLIGHT` only once it has disarmed.
+
+#### `Height Ceiling` (MagisV2 3.0+)
 
 A safety ceiling for indoor flying: in altitude hold the drone does not climb above it.
 The drone keeps it until it reboots.
@@ -395,10 +399,10 @@ battery_percentage = pluto.get_battery_percentage()
 
 ## Enhanced Battery Telemetry (Mobile App Features)
 
-The package supports enhanced battery telemetry matching the mobile app, on MagisV2 and on
-older Magis firmware.
+The package supports enhanced battery telemetry matching the mobile app, on MagisV2 3.0+
+and on older firmware.
 
-**MagisV2 sends its battery values ready to use.** State of charge, mAh drawn and
+**MagisV2 3.0+ sends its battery values ready to use.** State of charge, mAh drawn and
 remaining, and the battery warning come from the drone's own battery monitor and are
 returned exactly as sent; only the voltage is converted from mV to V. The battery capacity
 the drone uses for them is stored in the drone, not in the library.
@@ -407,7 +411,7 @@ Every battery method returns `None` when there is no current data (not connected
 nothing from the drone for about a second), and for values the connected firmware does not
 send. Nothing from an earlier connection is ever returned as current.
 
-### Battery Capacity (MagisV2)
+### Battery Capacity (MagisV2 3.0+)
 
 The drone stores its battery capacity and computes the state of charge and mAh from it
 (600 mAh by default). Change it when you fit a different pack, e.g. 1200 mAh on a Pluto
@@ -426,11 +430,13 @@ voltages stored with it. Do it on the ground, never in flight (it is refused whi
 
 ### Protocol Version Detection
 
-The firmware is detected automatically from the battery reply (10 bytes on MagisV2, 7 on
-older Magis):
+The firmware is detected automatically from the battery reply: 10 bytes on MagisV2 3.0 and
+later, 7 bytes on older firmware (Magis, and MagisV2 before 3.0). Older firmware flies
+exactly as before, and the functions marked "MagisV2 3.0+" are refused there with a
+message.
 
 ```python
-# 1 = MagisV2 battery layout, 0 = older Magis
+# 1 = MagisV2 3.0+ battery layout, 0 = older firmware
 print(f"Protocol Version: {pluto.MSP_Protocol_Version}")
 ```
 
@@ -487,7 +493,7 @@ still works and now returns the same as `get_battery_warning()` (it used to say 
 
 ### Individual Telemetry Parameters
 
-#### MagisV2 (Primus X2 / V5 boards)
+#### MagisV2 3.0+
 
 ```python
 #Get compensated battery voltage in volts
@@ -509,25 +515,25 @@ soc = pluto.get_state_of_charge()
 code = pluto.get_auto_land_status()
 ```
 
-#### Older Magis (Pluto / V4 boards)
+#### Older firmware (Magis, and MagisV2 before 3.0)
 
 ```python
 #Get battery voltage
 voltage = pluto.get_battery_voltage_compensated()
 
-#Get current draw
+#Get current draw in milliamps (sent in 0.01 A steps; the library converts it)
 current = pluto.get_current_mA()
 
 #Get signal strength (RSSI)
 rssi = pluto.get_rssi()
 
-#Get power meter sum
+#Get the reply's mAh value: mAh drawn on Magis, mAh remaining on MagisV2 before 3.0
 power_sum = pluto.get_power_meter_sum()
 ```
 
 ### Telemetry Data Structure
 
-**MagisV2 (`MSP_Protocol_Version` 1):**
+**MagisV2 3.0+ (`MSP_Protocol_Version` 1):**
 - `vBatComp`: Battery voltage, compensated (sent in mV, returned in volts)
 - `mAmpRaw`: Current draw in milliamps
 - `mAhDrawn`: Capacity consumed in milliamp-hours
@@ -535,11 +541,11 @@ power_sum = pluto.get_power_meter_sum()
 - `soc_Fused`: State of charge percentage (0-100)
 - `auto_LandMode`: Battery warning code (0 OK, 1 WARNING, 2 CRITICAL)
 
-**Older Magis (`MSP_Protocol_Version` 0):**
+**Older firmware (`MSP_Protocol_Version` 0):**
 - `bytevbat`: Battery voltage in decivolts (divide by 10 for volts)
-- `pMeterSum`: Power meter sum
+- `pMeterSum`: mAh drawn (Magis) or mAh remaining (MagisV2 before 3.0)
 - `rssi`: Signal strength indicator
-- `amperage`: Current draw in milliamps
+- `amperage`: Current draw as sent, in 0.01 A steps (`get_current_mA()` returns mA)
 
 ## Wifi Configuration (Telnet / AT Commands)
 

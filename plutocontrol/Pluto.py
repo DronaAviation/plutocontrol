@@ -14,14 +14,14 @@ RC_CENTER = 1500
 RC_MAX = 2000
 MOVE_STRENGTH_DEFAULT = 200  # MagisV2: offset from centre for forward()/left()/left_yaw()/..., same in every direction
 MOVE_STRENGTH_MAX = 500      # 1500 +/- 500 is the full stick range
-# Older Magis firmware keeps the original (uneven) default offsets
+# Older firmware (Magis, and MagisV2 before 3.0) keeps the original (uneven) default offsets
 LEGACY_MOVE_OFFSET = {'forward': 100, 'backward': 200, 'left': 300, 'right': 100,
                       'left_yaw': 200, 'right_yaw': 100}
 ARM_AUX_MIN = 1300           # AUX4 at or above this arms (MagisV2 ARM range 1300-2100)
 LINK_TIMEOUT = 3.0           # seconds without any data from the drone: the link is lost
 
-# Battery Constants (1S LiPo): only for the voltage estimate on older Magis boards.
-# MagisV2 sends its own state of charge and mAh, computed with the capacity stored in
+# Battery Constants (1S LiPo): only for the voltage estimate on older firmware.
+# MagisV2 3.0+ sends its own state of charge and mAh, computed with the capacity stored in
 # the drone, so the library does no battery maths for it.
 BATTERY_MAX_VOLTAGE = 4.2  # Fully charged
 BATTERY_IDLE_VOLTAGE = 3.7  # Nominal/idle
@@ -59,7 +59,7 @@ HEIGHT_MAX_CM = 10000   # 100 m: catches values passed in mm by mistake
 
 MSP_MOTOR_COUNT = 8     # MSP_SET_MOTOR always carries 8 motors (the firmware reads 8)
 
-# Flight status and height ceiling (MagisV2)
+# Flight status and height ceiling (MagisV2 3.0+)
 MSP_MAX_ALT = 123        # reply: int16 ceiling in cm, -1 = none
 MSP_SET_MAX_ALT = 218    # [int16 cm], -1 = no ceiling; applies in altitude hold, until reboot
 MSP_FLIGHT_STATUS = 255  # reply: uint16 with one bit set, the drone's highest-priority state
@@ -68,7 +68,7 @@ FLIGHT_STATUS_NAMES = ['ACCEL_GYRO_CALIBRATION', 'MAG_CALIBRATION', 'ARMED', 'OK
                        'LOW_BATTERY_IN_FLIGHT']
 REQUEST_REUSE_AGE = 0.1  # s: on-demand replies younger than this are reused (<= 10 requests/s)
 
-# Battery capacity stored in the drone (MagisV2)
+# Battery capacity stored in the drone (MagisV2 3.0+)
 MSP_VOLTAGE_METER_CONFIG = 56      # reply: u8 max, u8 min, u8 warning (0.1 V per cell), u16 capacity mAh
 MSP_SET_VOLTAGE_METER_CONFIG = 57  # [u8 max, u8 warning, u8 min, u16 capacity mAh]: warning before min
 BATTERY_CAPACITY_MIN = 100   # mAh
@@ -111,7 +111,8 @@ class Pluto:
         self.TCP_PORT = port
         
         # MSP Protocol Version (Pluto drones use Protocol V1)
-        # 1 = MagisV2 battery layout (BMS values), 0 = older Magis 7-byte layout.
+        # 1 = MagisV2 3.0+ battery layout (10 bytes, BMS values), 0 = 7-byte layout of older
+        # firmware (Magis, and MagisV2 before 3.0).
         # Set automatically from every MSP_ANALOG reply (see get_analog_telemetry).
         self.MSP_Protocol_Version = 1
         
@@ -149,7 +150,7 @@ class Pluto:
         self._frames_cv = Condition()  # wakes getters waiting for a new reply
         self._rejected_cmds = set()    # MSP commands the drone answered with an error
         self._not_connected_logged = False
-        self._fw_v2 = None             # True: MagisV2, False: older Magis, None: no MSP_ANALOG reply yet
+        self._fw_v2 = None             # True: MagisV2 3.0+, False: older firmware, None: no MSP_ANALOG reply yet
         self._motor_test_used = False  # motor_speed() left non-idle values on a MagisV2 drone
 
         # Developer Mode (Serial Debug)
@@ -255,7 +256,8 @@ class Pluto:
 
     def _magis_v2(self) -> bool:
         """
-        True for MagisV2 firmware (10-byte MSP_ANALOG reply), False for older Magis (7 bytes).
+        True for MagisV2 3.0+ (10-byte MSP_ANALOG reply), False for older firmware (7 bytes:
+        Magis, and MagisV2 before 3.0).
 
         Right after connect() it waits up to 1 s for the first reply. Without one (not
         connected, or no telemetry) it assumes MagisV2, the library's default.
@@ -381,8 +383,8 @@ class Pluto:
         self.dev_mode_enabled = False
         
     # Movement: each call holds its stick at 1500 +/- strength until reset() or another
-    # call. On MagisV2 every direction defaults to 200, so opposite moves are equally
-    # strong. Older Magis firmware keeps its original defaults (LEGACY_MOVE_OFFSET).
+    # call. On MagisV2 3.0+ every direction defaults to 200, so opposite moves are equally
+    # strong. Older firmware keeps its original defaults (LEGACY_MOVE_OFFSET).
 
     @staticmethod
     def _in_range(name: str, value, low: int, high: int) -> bool:
@@ -400,7 +402,7 @@ class Pluto:
         return None
 
     def forward(self, strength: Optional[int] = None) -> None:
-        """Move forward: pitch = 1500 + strength (int 0-500; default 200 on MagisV2, 100 on older Magis)."""
+        """Move forward: pitch = 1500 + strength (int 0-500; default 200 on MagisV2 3.0+, 100 on older firmware)."""
         offset = self._move_offset('forward', strength)
         if offset is not None:
             print("Forward")
@@ -416,7 +418,7 @@ class Pluto:
                 self.rcPitch = RC_CENTER - offset
 
     def left(self, strength: Optional[int] = None) -> None:
-        """Move left: roll = 1500 - strength (int 0-500; default 200 on MagisV2, 300 on older Magis)."""
+        """Move left: roll = 1500 - strength (int 0-500; default 200 on MagisV2 3.0+, 300 on older firmware)."""
         offset = self._move_offset('left', strength)
         if offset is not None:
             print("Left Roll")
@@ -424,7 +426,7 @@ class Pluto:
                 self.rcRoll = RC_CENTER - offset
 
     def right(self, strength: Optional[int] = None) -> None:
-        """Move right: roll = 1500 + strength (int 0-500; default 200 on MagisV2, 100 on older Magis)."""
+        """Move right: roll = 1500 + strength (int 0-500; default 200 on MagisV2 3.0+, 100 on older firmware)."""
         offset = self._move_offset('right', strength)
         if offset is not None:
             print("Right Roll")
@@ -440,7 +442,7 @@ class Pluto:
                 self.rcYaw = RC_CENTER - offset
 
     def right_yaw(self, strength: Optional[int] = None) -> None:
-        """Rotate right: yaw = 1500 + strength (int 0-500; default 200 on MagisV2, 100 on older Magis)."""
+        """Rotate right: yaw = 1500 + strength (int 0-500; default 200 on MagisV2 3.0+, 100 on older firmware)."""
         offset = self._move_offset('right_yaw', strength)
         if offset is not None:
             print("Right Yaw")
@@ -477,9 +479,9 @@ class Pluto:
         Command the drone to Take Off.
         Switches to Auto-Takeoff mode.
 
-        MagisV2: arms with the sticks centred (throttle 1500), which the firmware needs
+        MagisV2 3.0+: arms with the sticks centred (throttle 1500), which the firmware needs
         to take off; the drone then climbs to its take-off height (120 cm) and holds it.
-        Older Magis: throttle 1800, as before.
+        Older firmware (Magis, MagisV2 before 3.0): throttle 1800, as before.
         """
         print("Take off")
         if not self._magis_v2():
@@ -798,8 +800,8 @@ class Pluto:
             self._link_lost(f"writer thread error: {e!r}")
 
     def _write_loop(self):
-        # MSP_RC's reply is never read. MagisV2 drones are not asked for it, which leaves
-        # them more room (they serve one MSP command per 3.5 ms); older Magis still are.
+        # MSP_RC's reply is never read. MagisV2 3.0+ drones are not asked for it, which leaves
+        # them more room (they serve one MSP command per 3.5 ms); older firmware still is.
         requests_v2 = [MSP_ATTITUDE, MSP_RAW_IMU, MSP_ALTITUDE, MSP_ANALOG]
         requests_legacy = [MSP_RC] + requests_v2
         slot_skip = 0  # telemetry request that gives its slot to the next height / LED packet
@@ -998,12 +1000,13 @@ class Pluto:
         if not self._refuse_if_armed("calibrate_magnetometer"):
             self.send_request_msp(self.create_packet_msp(MSP_MAG_CALIBRATION, []))
 
-    # ── Flight status and height ceiling (MagisV2) ──────────────────────────
+    # ── Flight status and height ceiling (MagisV2 3.0+) ─────────────────────
 
     def _requires_magis_v2(self, what: str) -> bool:
         if self._magis_v2():
             return True
-        print(f"{what}: needs MagisV2 firmware")
+        print(f"{what}: needs MagisV2 3.0 or later (this drone sends the 7-byte battery "
+              "reply of older firmware)")
         return False
 
     def _request(self, cmd: int, min_size: int) -> Optional[bytes]:
@@ -1024,11 +1027,16 @@ class Pluto:
 
     def get_flight_status(self) -> Optional[str]:
         """
-        The drone's flight status, as the Pluto app shows it (MagisV2).
+        The drone's flight status, as the Pluto app shows it (MagisV2 3.0+).
 
         The drone reports its single most important state, in this order: calibrating,
         crash, low battery, signal loss, not OK to arm, OK to arm, armed. Use it to find
         out why arm() or take_off() did nothing.
+
+        A critical battery depends on the firmware: MagisV2 3.0.0 reports
+        LOW_BATTERY_IN_FLIGHT, armed or not. The CG tilt firmware (and ws28py) reports
+        LOW_BATTERY while armed, when it is landing by itself, and LOW_BATTERY_IN_FLIGHT
+        only once disarmed, which blocks re-arming in the app.
 
         Returns:
             str or None: 'ACCEL_GYRO_CALIBRATION', 'MAG_CALIBRATION', 'CRASH',
@@ -1048,12 +1056,14 @@ class Pluto:
 
     def is_armed(self) -> Optional[bool]:
         """
-        Whether the drone is armed, from its flight status (MagisV2).
+        Whether the drone is armed, from its flight status (MagisV2 3.0+).
 
         Returns:
             bool or None: True if it reports ARMED, False if it reports OK_TO_ARM,
             NOT_OK_TO_ARM or a calibration. None if there is no reply, or a more important
-            state (crash, low battery, signal loss) hides whether it is armed.
+            state (crash, low battery, signal loss) hides whether it is armed: a critical
+            battery is reported while armed on some firmware and after landing on others
+            (see get_flight_status()).
         """
         status = self.get_flight_status()
         if status == 'ARMED':
@@ -1064,7 +1074,7 @@ class Pluto:
 
     def set_max_height(self, height_cm: Optional[int]) -> None:
         """
-        Set a height ceiling in cm (MagisV2), or remove it with None.
+        Set a height ceiling in cm (MagisV2 3.0+), or remove it with None.
 
         In altitude hold the drone does not climb above it. The drone keeps it until it
         reboots.
@@ -1080,7 +1090,7 @@ class Pluto:
 
     def get_max_height(self) -> Optional[int]:
         """
-        The drone's height ceiling in cm (MagisV2).
+        The drone's height ceiling in cm (MagisV2 3.0+).
 
         Returns:
             int or None: Ceiling in cm, -1 if there is none, None if no reply.
@@ -1110,7 +1120,7 @@ class Pluto:
         Get the battery percentage.
 
         On Protocol V1 boards this is the drone's own state of charge from its BMS,
-        returned as sent. Older boards do not send one, so it is estimated from the
+        returned as sent. Older firmware does not send one, so it is estimated from the
         voltage (3.7 V = 0 %, 4.2 V = 100 %).
 
         Returns:
@@ -1244,7 +1254,7 @@ class Pluto:
 
     def _store_frame(self, cmd: int, payload: bytes) -> None:
         if cmd == MSP_ANALOG:
-            self._fw_v2 = len(payload) >= 10  # MagisV2 sends 10 bytes, older Magis 7
+            self._fw_v2 = len(payload) >= 10  # MagisV2 3.0+ sends 10 bytes, older firmware 7
         with self._frames_cv:
             self._frames[cmd] = (payload, time.monotonic())
             self._frames_cv.notify_all()
@@ -1321,8 +1331,8 @@ class Pluto:
         Only vBatComp is scaled, from mV to volts.
 
         The reply's size tells which layout the board sends, and MSP_Protocol_Version is
-        set from it: 1 for MagisV2 (10 bytes, BMS values), 0 for older Magis firmware
-        (7 bytes, MultiWii layout).
+        set from it: 1 for MagisV2 3.0+ (10 bytes, BMS values), 0 for older firmware
+        (7 bytes, MultiWii layout: Magis, and MagisV2 before 3.0).
 
         Returns:
             dict or None: None if no reply arrived. Keys depend on MSP_Protocol_Version.
@@ -1348,7 +1358,8 @@ class Pluto:
                 'protocol_version': 1
             }
 
-        # Older boards: u8 vbat (0.1 V), u16 power meter sum, u16 RSSI, s16 amperage
+        # Older firmware: u8 vbat (0.1 V), u16 mAh (drawn on Magis, remaining on MagisV2
+        # before 3.0), u16 RSSI, s16 amperage in 0.01 A steps (not mA)
         self.bytevbat = data[0]
         self.pMeterSum = int.from_bytes(data[1:3], 'little')
         self.rssi = int.from_bytes(data[3:5], 'little')
@@ -1361,7 +1372,7 @@ class Pluto:
             'protocol_version': self.MSP_Protocol_Version
         }
 
-    # The drone (MagisV2) sends its battery values ready to use: state of charge, mAh and
+    # The drone (MagisV2 3.0+) sends its battery values ready to use: state of charge, mAh and
     # its warning come from its own BMS and are returned as sent. The helpers below read
     # one fresh MSP_ANALOG reply and return None without one, never a cached or made-up
     # value. Values the connected firmware does not send are None too.
@@ -1386,35 +1397,43 @@ class Pluto:
 
     def get_current_mA(self) -> Optional[int]:
         """Get current draw (mA), None if no data."""
-        return self._analog('mAmpRaw', 'amperage')
+        telemetry = self.get_analog_telemetry()
+        if telemetry is None:
+            return None
+        if telemetry['protocol_version'] == 1:
+            return telemetry['mAmpRaw']
+        return telemetry['amperage'] * 10  # older firmware sends 0.01 A steps
 
     def get_capacity_drawn_mAh(self) -> Optional[int]:
-        """Get capacity consumed (mAh) as the drone reports it, None if no data (MagisV2 only)."""
+        """Get capacity consumed (mAh) as the drone reports it, None if no data (MagisV2 3.0+ only)."""
         return self._analog('mAhDrawn')
 
     def get_capacity_remaining_mAh(self) -> Optional[int]:
-        """Get capacity remaining (mAh) as the drone reports it, None if no data (MagisV2 only)."""
+        """Get capacity remaining (mAh) as the drone reports it, None if no data (MagisV2 3.0+ only)."""
         return self._analog('mAhRemain')
 
     def get_state_of_charge(self) -> Optional[int]:
-        """Get the drone's State of Charge (0-100%), None if no data (MagisV2 only)."""
+        """Get the drone's State of Charge (0-100%), None if no data (MagisV2 3.0+ only)."""
         return self._analog('soc_Fused')
 
     def get_auto_land_status(self) -> Optional[int]:
         """
         Get the drone's battery warning code as sent: 0 OK, 1 WARNING, 2 CRITICAL.
 
-        None if no data (MagisV2 only). Despite the name this is not an auto-land state:
+        None if no data (MagisV2 3.0+ only). Despite the name this is not an auto-land state:
         see get_battery_warning().
         """
         return self._analog('auto_LandMode')
 
     def get_rssi(self) -> Optional[int]:
-        """Get signal strength RSSI, None if no data (older Magis only)."""
+        """Get signal strength RSSI, None if no data (older firmware only)."""
         return self._analog(None, 'rssi')
 
     def get_power_meter_sum(self) -> Optional[int]:
-        """Get power meter sum, None if no data (older Magis only)."""
+        """
+        Get the mAh value of the older 7-byte battery reply, None if no data (older firmware
+        only). Magis sends mAh drawn here, MagisV2 before 3.0 mAh remaining.
+        """
         return self._analog(None, 'pMeterSum')
 
     def get_battery_info(self) -> Optional[Dict[str, Any]]:
@@ -1442,7 +1461,7 @@ class Pluto:
             }
         return {
             'voltage': f"{telemetry['bytevbat']:.2f}V",
-            'current': f"{telemetry.get('amperage', 0)}mA",
+            'current': f"{telemetry['amperage'] * 10}mA",  # sent in 0.01 A steps
             'rssi': telemetry['rssi'],
             'power_sum': telemetry['pMeterSum'],
             'protocol': "Legacy"
@@ -1474,7 +1493,7 @@ class Pluto:
 
     def get_battery_warning(self) -> Optional[str]:
         """
-        Get the drone's own battery warning (MagisV2).
+        Get the drone's own battery warning (MagisV2 3.0+).
 
         The CG tilt firmware sends CRITICAL as WARNING while armed: it is then landing by
         itself, and the app only warns. No MSP reply tells "auto-landing" apart.
@@ -1581,11 +1600,11 @@ class Pluto:
             'should_auto_land': code >= 1
         }
 
-    # ── Battery capacity stored in the drone (MagisV2) ──────────────────────
+    # ── Battery capacity stored in the drone (MagisV2 3.0+) ─────────────────
 
     def get_battery_capacity(self) -> Optional[int]:
         """
-        The battery capacity stored in the drone, in mAh (MagisV2).
+        The battery capacity stored in the drone, in mAh (MagisV2 3.0+).
 
         The drone computes its state of charge and mAh remaining from it.
 
@@ -1599,7 +1618,7 @@ class Pluto:
 
     def set_battery_capacity(self, capacity_mah: int) -> bool:
         """
-        Store a new battery capacity in the drone, in mAh (MagisV2), e.g. 1200 for a Pluto
+        Store a new battery capacity in the drone, in mAh (MagisV2 3.0+), e.g. 1200 for a Pluto
         Guru pack.
 
         The drone uses a new capacity only after a restart, so saving it stops the flight
