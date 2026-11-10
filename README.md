@@ -29,6 +29,20 @@ pluto = Pluto(ip='192.168.1.100')
 
 ```
 
+### Try Every Function
+
+`examples/api_test_menu.py` lists every plutocontrol function by number: type a number to
+run it, and it asks for any values it needs. `t` runs every read-only function once as a
+quick self-test, `x` or Ctrl+C disarms at once, `q` quits.
+
+```bash
+python examples/api_test_menu.py               # asks for the drone's IP
+python examples/api_test_menu.py 192.168.4.1   # IP given
+```
+
+Try it on the ground with the propellers off first: movement and height commands make the
+drone fly.
+
 ### Example Usage
 
 #### Example 1: Basic Usage (Default IP)
@@ -329,13 +343,16 @@ pluto.set_max_height(None)    # remove the ceiling
 
 #### `set_height(cm)`: hold a height
 
-Sets the height the drone holds, in cm (0-10000). The drone climbs or descends to it
+Sets the height the drone holds, in cm (20-10000). The drone climbs or descends to it
 smoothly. Call it after take-off (take-off sets its own 120 cm target) and keep the
 throttle centred: `increase_height()` / `decrease_height()` take over from the target.
 
-**Needs firmware with MSP 227** (the ws28py build today; it is being added to the MagisV2
-CG tilt branch). Other firmware refuses it and the library prints
-`set_height: needs firmware with MSP 227`; nothing else is affected.
+**Needs firmware with MSP 227** (the ws28py build, and the MagisV2 CG tilt branch once
+DronaAviation/MagisV2#49 is released). Other firmware refuses it and the library prints a
+message; nothing else is affected. The drone takes it only while flying in altitude hold:
+not before take-off, while landing (a landing can't be undone from Python) or during a
+flip. A target above the `set_max_height()` ceiling is lowered under it. To go down, use
+`land()`.
 
 ```python
 pluto.take_off()
@@ -384,6 +401,23 @@ the drone uses for them is stored in the drone, not in the library.
 Every battery method returns `None` when there is no current data (not connected, or
 nothing from the drone for about a second), and for values the connected firmware does not
 send. Nothing from an earlier connection is ever returned as current.
+
+### Battery Capacity (MagisV2)
+
+The drone stores its battery capacity and computes the state of charge and mAh from it
+(600 mAh by default). Change it when you fit a different pack, e.g. 1200 mAh on a Pluto
+Guru:
+
+```python
+capacity = pluto.get_battery_capacity()   # mAh, None if no reply
+pluto.set_battery_capacity(1200)          # 100-5000 mAh, drone disarmed
+```
+
+**The drone uses a new capacity only after a restart, so saving it stops the flight
+controller: its LEDs blink green and blue until you switch it off and on.**
+`set_battery_capacity()` checks that the drone stopped, disconnects, and tells you to
+power-cycle it. It writes nothing if the capacity is already set, and keeps the battery
+voltages stored with it. Do it on the ground, never in flight (it is refused while armed).
 
 ### Protocol Version Detection
 

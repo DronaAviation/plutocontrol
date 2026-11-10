@@ -54,6 +54,7 @@ LED_QUEUE_MAX = 64      # queued LED packets before set_led() waits for the dron
 
 # Altitude-hold target (needs MagisV2 firmware with MSP 227)
 MSP_SET_ALT_HOLD = 227  # [int32 cm]: same as setDesiredPosition(Z, cm) in PlutoPilot.cpp
+HEIGHT_MIN_CM = 20      # set_height: lower targets would sit armed on the floor (land() goes down)
 HEIGHT_MAX_CM = 10000   # 100 m: catches values passed in mm by mistake
 
 MSP_MOTOR_COUNT = 8     # MSP_SET_MOTOR always carries 8 motors (the firmware reads 8)
@@ -67,12 +68,19 @@ FLIGHT_STATUS_NAMES = ['ACCEL_GYRO_CALIBRATION', 'MAG_CALIBRATION', 'ARMED', 'OK
                        'LOW_BATTERY_IN_FLIGHT']
 REQUEST_REUSE_AGE = 0.1  # s: on-demand replies younger than this are reused (<= 10 requests/s)
 
+# Battery capacity stored in the drone (MagisV2)
+MSP_VOLTAGE_METER_CONFIG = 56      # reply: u8 max, u8 min, u8 warning (0.1 V per cell), u16 capacity mAh
+MSP_SET_VOLTAGE_METER_CONFIG = 57  # [u8 max, u8 warning, u8 min, u16 capacity mAh]: warning before min
+BATTERY_CAPACITY_MIN = 100   # mAh
+BATTERY_CAPACITY_MAX = 5000  # mAh
+
 # Why the drone may refuse these ($M!). Firmware without the plutocontrol extensions
 # (225-227) refuses them as unknown and nothing else happens; other functions still work.
 REJECT_HINTS = {
     MSP_SET_RGB_LED: "LED colour: needs firmware with MSP 225/226, and led_init() first",
     MSP_RGB_LED_CTRL: "LED strip: needs firmware with MSP 225/226; disarm first, PA8 must be free",
-    MSP_SET_ALT_HOLD: "set_height: needs firmware with MSP 227",
+    MSP_SET_ALT_HOLD: ("set_height: needs firmware with MSP 227, and works only while flying "
+                       "in altitude hold (after take-off, not while landing or in a flip)"),
     MSP_EEPROM_WRITE: "EEPROM write: refused while armed",
 }
 
@@ -641,9 +649,13 @@ class Pluto:
         calling it in a loop never builds a backlog.
 
         Args:
-            height_cm (int): Target height in cm (0-10000).
+            height_cm (int): Target height in cm (20-10000).
+
+        The drone takes it only while flying in altitude hold: not before take-off, while
+        landing or during a flip (it answers with an error, printed once). A target above
+        the set_max_height() ceiling is lowered under it.
         """
-        if not self._in_range("height", height_cm, 0, HEIGHT_MAX_CM):
+        if not self._in_range("height", height_cm, HEIGHT_MIN_CM, HEIGHT_MAX_CM):
             return
         if not self.connected:
             self._warn_not_connected()
@@ -1541,3 +1553,76 @@ class Pluto:
             'is_low': soc < 40,
             'should_auto_land': code >= 1
         }
+
+    # ── Battery capacity stored in the drone (MagisV2) ──────────────────────
+
+    def get_battery_capacity(self) -> Optional[int]:
+        """
+        The battery capacity stored in the drone, in mAh (MagisV2).
+
+        The drone computes its state of charge and mAh remaining from it.
+
+        Returns:
+            int or None: Capacity in mAh, None if no reply.
+        """
+        if not self._requires_magis_v2("get_battery_capacity"):
+            return None
+        data = self._request(MSP_VOLTAGE_METER_CONFIG, 5)
+        return None if data is None else int.from_bytes(data[3:5], 'little')
+
+    def set_battery_capacity(self, capacity_mah: int) -> bool:
+        """
+        Store a new battery capacity in the drone, in mAh (MagisV2), e.g. 1200 for a Pluto
+        Guru pack.
+
+        The drone uses a new capacity only after a restart, so saving it stops the flight
+        controller: it blinks its LEDs green and blue until you switch it off and on. Call
+        it on the ground with the drone disarmed. The library checks that the drone
+        stopped, disconnects, and tells you to power-cycle it. The battery voltages stored
+        with the capacity are kept, and nothing is written if the capacity is already set.
+
+        Args:
+            capacity_mah (int): 100-5000 mAh.
+
+        Returns:
+            bool: True if the new capacity was saved (or was already set).
+        """
+        if not self._in_range("battery capacity", capacity_mah, BATTERY_CAPACITY_MIN, BATTERY_CAPACITY_MAX):
+            return False
+        if not self._requires_magis_v2("set_battery_capacity") or self._refuse_if_armed("set_battery_capacity"):
+            return False
+        data = self._request(MSP_VOLTAGE_METER_CONFIG, 5)
+        if data is None:
+            print("set_battery_capacity: no reply from the drone, nothing changed")
+            return False
+        v_max, v_min, v_warning = data[0], data[1], data[2]
+        current = int.from_bytes(data[3:5], 'little')
+        if current == capacity_mah:
+            # The drone stops after any capacity write, even an unchanged one: don't write.
+            print(f"Battery capacity is already {current} mAh: nothing to change")
+            return True
+
+        # The write order is max, warning, min (the read order is max, min, warning)
+        payload = [v_max, v_warning, v_min] + list(capacity_mah.to_bytes(2, 'little'))
+        sent_at = time.monotonic()
+        if not (self.send_request_msp(self.create_packet_msp_u8(MSP_SET_VOLTAGE_METER_CONFIG, payload))
+                and self.send_request_msp(self.create_packet_msp(MSP_EEPROM_WRITE, []))):
+            return False
+
+        # After saving, the drone stops answering. Wait up to 4 s for 1 s of silence.
+        stopped = False
+        while time.monotonic() - sent_at < 4.0 and self.connected:
+            time.sleep(0.1)
+            with self._frames_cv:
+                last = max((t for _, t in self._frames.values()), default=0.0)
+            if time.monotonic() - max(last, sent_at) >= 1.0:
+                stopped = True
+                break
+        if not stopped and self.connected:
+            print("set_battery_capacity: the drone kept answering, so the new capacity may not be "
+                  "saved. Check it with get_battery_capacity().")
+            return False
+        print(f"Battery capacity saved: {capacity_mah} mAh (was {current} mAh). The drone is "
+              "blinking its LEDs: switch it off and on, then connect() again.")
+        self.disconnect()
+        return True
