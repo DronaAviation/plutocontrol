@@ -74,13 +74,19 @@ MSP_SET_VOLTAGE_METER_CONFIG = 57  # [u8 max, u8 warning, u8 min, u16 capacity m
 BATTERY_CAPACITY_MIN = 100   # mAh
 BATTERY_CAPACITY_MAX = 5000  # mAh
 
+# Laser ranges (firmware with MSP 228, e.g. ws28py)
+MSP_LASER_RANGES = 228  # reply: per laser in LASER_NAMES order: int16 range mm (-100 no sample, -1 off), u8 status
+LASER_NAMES = ['left', 'right', 'front', 'back', 'external', 'down']
+LASER_STATUS_NAMES = ['NOT_ENABLED', 'OK', 'BOOT_FAILED', 'I2C_ERROR', 'OUT_OF_RANGE']
+
 # Why the drone may refuse these ($M!). Firmware without the plutocontrol extensions
-# (225-227) refuses them as unknown and nothing else happens; other functions still work.
+# (225-228) refuses them as unknown and nothing else happens; other functions still work.
 REJECT_HINTS = {
     MSP_SET_RGB_LED: "LED colour: needs firmware with MSP 225/226, and led_init() first",
     MSP_RGB_LED_CTRL: "LED strip: needs firmware with MSP 225/226; disarm first, PA8 must be free",
     MSP_SET_ALT_HOLD: ("set_height: needs firmware with MSP 227, and works only while flying "
                        "in altitude hold (after take-off, not while landing or in a flip)"),
+    MSP_LASER_RANGES: "laser ranges: needs firmware with MSP 228 (ws28py)",
     MSP_EEPROM_WRITE: "EEPROM write: refused while armed",
 }
 
@@ -1016,6 +1022,8 @@ class Pluto:
         A reply younger than REQUEST_REUSE_AGE is reused, so calling in a loop adds at
         most ~10 requests per second to the drone's MSP load.
         """
+        if cmd in self._rejected_cmds:
+            return None  # refused earlier on this connection (said once): don't wait 1 s on every call
         with self._frames_cv:
             frame = self._frames.get(cmd)
             if frame and time.monotonic() - frame[1] <= REQUEST_REUSE_AGE and len(frame[0]) >= min_size:
@@ -1099,6 +1107,78 @@ class Pluto:
             return None
         data = self._request(MSP_MAX_ALT, 2)
         return None if data is None else int.from_bytes(data[:2], 'little', signed=True)
+
+    # ── Laser ranges (firmware with MSP 228, e.g. ws28py) ───────────────────
+
+    def get_laser_ranges(self) -> Optional[Dict[str, Dict[str, Any]]]:
+        """
+        Range and health of every laser (VL53L0X / VL53L1X), in one request.
+
+        Needs firmware with MSP 228, such as ws28py. The drone reads its lasers by
+        itself (the down laser every 33 ms, each side laser about every 40 ms) and sends
+        its latest samples. A laser runs only if the firmware's plutoInit() enables it,
+        e.g. XRanging.initAlt(GPIO_5) for the down laser, XRanging.init(FRONT) for the
+        front one.
+
+        Returns:
+            dict or None: One entry per laser, 'left', 'right', 'front', 'back',
+            'external' and 'down' (the bottom laser used for altitude hold), each
+            {'range_mm': int or None, 'status': str}. range_mm is None when the laser
+            has no valid sample. status is 'OK', 'OUT_OF_RANGE' (nothing in reach),
+            'NOT_ENABLED', 'BOOT_FAILED' or 'I2C_ERROR' (stopped until power-off).
+            None if there is no reply.
+        """
+        if not self._requires_magis_v2("get_laser_ranges"):
+            return None
+        data = self._request(MSP_LASER_RANGES, 3 * len(LASER_NAMES))
+        if data is None:
+            return None
+        lasers = {}
+        for i, name in enumerate(LASER_NAMES):
+            range_mm = int.from_bytes(data[3 * i:3 * i + 2], 'little', signed=True)
+            code = data[3 * i + 2]
+            status = LASER_STATUS_NAMES[code] if code < len(LASER_STATUS_NAMES) else f'UNKNOWN_{code}'
+            lasers[name] = {'range_mm': range_mm if status == 'OK' and range_mm >= 0 else None,
+                            'status': status}
+        return lasers
+
+    def _laser_entry(self, laser: str) -> Optional[Dict[str, Any]]:
+        if laser not in LASER_NAMES:
+            print(f"laser must be one of {', '.join(LASER_NAMES)}, not {laser!r}")
+            return None
+        lasers = self.get_laser_ranges()
+        return None if lasers is None else lasers[laser]
+
+    def get_laser_range(self, laser: str) -> Optional[int]:
+        """
+        One laser's latest range in mm (firmware with MSP 228, e.g. ws28py).
+
+        Args:
+            laser (str): 'front', 'down' (the bottom laser), 'left', 'right', 'back'
+                or 'external'.
+
+        Returns:
+            int or None: Range in mm. None if the laser has no valid sample (nothing in
+            reach, not enabled, or failed: get_laser_status() says which) or there is
+            no reply.
+        """
+        entry = self._laser_entry(laser)
+        return None if entry is None else entry['range_mm']
+
+    def get_laser_status(self, laser: str) -> Optional[str]:
+        """
+        One laser's health (firmware with MSP 228, e.g. ws28py).
+
+        Args:
+            laser (str): 'front', 'down' (the bottom laser), 'left', 'right', 'back'
+                or 'external'.
+
+        Returns:
+            str or None: 'OK', 'OUT_OF_RANGE', 'NOT_ENABLED', 'BOOT_FAILED' or
+            'I2C_ERROR'; None if there is no reply.
+        """
+        entry = self._laser_entry(laser)
+        return None if entry is None else entry['status']
 
     def get_battery(self) -> Optional[float]:
         """

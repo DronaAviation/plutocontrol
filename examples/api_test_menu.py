@@ -176,6 +176,17 @@ def wait_leds(p):
     return p.wait_leds(ask("timeout in seconds", float, 3.0))
 
 
+def laser(method, name):
+    def run(p):
+        value = getattr(p, method)(name)
+        if value is None:
+            why = ("no valid sample, or no reply: get_laser_status('{}') says which".format(name)
+                   if method == "get_laser_range" else "no reply")
+            print("  -> None ({})".format(why))
+        return value
+    return run
+
+
 def monitor(p):
     seconds = ask("show live telemetry for seconds", float, 10.0)
     print("  height cm | roll  pitch   yaw | vario | battery V  SoC %  warning | status")
@@ -229,6 +240,11 @@ MENU = [
     ("Telemetry", "get_mag_y()", "get_mag_y"),
     ("Telemetry", "get_mag_z()", "get_mag_z"),
     ("Telemetry", "live telemetry monitor", monitor),
+    ("Lasers", "get_laser_ranges()  (MSP 228)", "get_laser_ranges"),
+    ("Lasers", "get_laser_range('down')", laser("get_laser_range", "down")),
+    ("Lasers", "get_laser_range('front')", laser("get_laser_range", "front")),
+    ("Lasers", "get_laser_status('down')", laser("get_laser_status", "down")),
+    ("Lasers", "get_laser_status('front')", laser("get_laser_status", "front")),
     ("Status", "get_flight_status()", "get_flight_status"),
     ("Status", "is_armed()", "is_armed"),
     ("Battery", "get_battery()", "get_battery"),
@@ -276,7 +292,7 @@ SELF_TEST = [
     "get_battery_warning", "get_auto_land_status", "get_auto_land_status_text",
     "get_battery_level_status", "is_battery_low", "is_battery_critical", "should_auto_land",
     "get_battery_info", "get_battery_status_summary", "get_rssi", "get_power_meter_sum",
-    "get_battery_capacity",
+    "get_battery_capacity", "get_laser_ranges",
 ]
 
 

@@ -369,6 +369,32 @@ time.sleep(0.2)
 print(pluto.is_height_accepted())   # True: the drone is on its way to 80 cm
 ```
 
+#### `Laser ranges` (VL53L0X / VL53L1X)
+
+Reads the drone's laser rangefinders: the bottom one that altitude hold uses, and the side
+ones (front, back, left, right, external). **Needs firmware with MSP 228** (the ws28py build).
+Other firmware refuses it once, the library prints a message, and the getters return `None`.
+
+The lasers run only if the firmware's `PlutoPilot.cpp` enables them in `plutoInit()`, for
+example a bottom laser with its XSHUT on GPIO_5 and a front laser:
+
+```cpp
+XRanging.initAlt ( GPIO_5 );   // bottom laser: altitude hold uses it below 160 cm
+XRanging.init ( FRONT );       // front laser (XSHUT on GPIO_16): range only
+```
+
+```python
+print(pluto.get_laser_range('front'))    # mm, None if nothing is in reach
+print(pluto.get_laser_range('down'))     # the bottom laser, mm
+print(pluto.get_laser_status('front'))   # 'OK', 'OUT_OF_RANGE', 'NOT_ENABLED', 'BOOT_FAILED' or 'I2C_ERROR'
+print(pluto.get_laser_ranges())          # every laser at once: {'front': {'range_mm': 412, 'status': 'OK'}, ...}
+```
+
+A range is `None` whenever the laser has no valid sample; the status says why. The drone
+updates the bottom laser every 33 ms and each side laser about every 40 ms; calling these
+in a loop sends at most about 10 requests a second. Reading the front laser does not make
+the drone avoid anything: stop or turn it yourself.
+
 #### `RGB LED strip` (WS2812B)
 
 Controls a WS2812B LED strip on the drone. **Needs firmware with MSP 225/226** (the ws28py
